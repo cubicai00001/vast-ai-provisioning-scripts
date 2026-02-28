@@ -8,9 +8,6 @@ MODELS_DIR="${FORGE_DIR}/models"
 SEMAPHORE_DIR="${WORKSPACE_DIR}/download_sem_$$"
 MAX_PARALLEL="${MAX_PARALLEL:-1}"
 
-APT_PACKAGES=()
-PIP_PACKAGES=()
-
 EXTENSIONS=(
     "https://github.com/wkpark/uddetailer"
     "https://github.com/Coyote-A/ultimate-upscale-for-automatic1111"
@@ -22,28 +19,26 @@ EXTENSIONS=(
     "https://github.com/Bing-su/adetailer"
 )
 
-HF_MODELS_DEFAULT=()
-
 CIVITAI_MODELS_DEFAULT=(
-    # Pony Diffusion V6 XL (primary with mirrors)
+    # Pony Diffusion V6 XL - multiple sources (Civitai → HF → Tensor.art mirror)
     "https://civitai.com/api/download/models/290640?type=Model&format=SafeTensor&size=pruned&fp=fp16 https://huggingface.co/LyliaEngine/Pony_Diffusion_V6_XL/resolve/main/ponyDiffusionV6XL.safetensors https://tensor.art/models/717274695390638697 | $MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors"
 
-    # Femboy (Otoko No Ko) v1.0 (primary; no mirror, abandon on fail)
+    # Femboy (Otoko No Ko) v1.0
     "https://civitai.com/api/download/models/222887?type=Model&format=SafeTensor | $MODELS_DIR/Lora/femboy_otoko_no_ko.safetensors"
 
-    # Femboy v1.0 (primary)
+    # Femboy v1.0
     "https://civitai.com/api/download/models/173782?type=Model&format=SafeTensor&size=full&fp=fp16 | $MODELS_DIR/Lora/femboy.safetensors"
 
-    # Femboi Full v1.0 (primary)
+    # Femboi Full v1.0
     "https://civitai.com/api/download/models/20797 | $MODELS_DIR/Lora/femboi_full_v1.safetensors"
 
-    # femboysXL v1.0 (primary; no mirror)
+    # femboysXL v1.0
     "https://civitai.com/api/download/models/324974 | $MODELS_DIR/Lora/femboysxl_v1.safetensors"
 
-    # Alternatives (similar job: femboy/male for Pony base)
-    "https://civitai.com/api/download/models/2625213?type=Model&format=SafeTensor | $MODELS_DIR/Lora/male_mix_pony.safetensors"  # Male Mix Pony v5.0
-    "https://civitai.com/api/download/models/1861600?type=Model&format=SafeTensor | $MODELS_DIR/Lora/femboy_pony.safetensors"  # Femboy pony v1.1
-    "https://huggingface.co/datasets/CollectorN01/PonyXL-Lora-MyAhhArchiveCN01/resolve/main/concept/CurvyFemboyXL.safetensors | $MODELS_DIR/Lora/curvy_femboy_xl.safetensors"  # CurvyFemboyXL (HF)
+    # Fallback alternatives (same job if primaries fail)
+    "https://civitai.com/api/download/models/2625213?type=Model&format=SafeTensor | $MODELS_DIR/Lora/male_mix_pony.safetensors"
+    "https://civitai.com/api/download/models/1861600?type=Model&format=SafeTensor | $MODELS_DIR/Lora/femboy_pony.safetensors"
+    "https://huggingface.co/datasets/CollectorN01/PonyXL-Lora-MyAhhArchiveCN01/resolve/main/concept/CurvyFemboyXL.safetensors | $MODELS_DIR/Lora/curvy_femboy_xl.safetensors"
 )
 
 ### End Configuration ###
@@ -54,7 +49,7 @@ log() {
 
 script_cleanup() {
     log "Cleaning up semaphore directory..."
-    rm -rf "$SEMAPHORE_DIR"
+    rm -rf "$SEMAPHORE_DIR" 2>/dev/null || true
     find "$MODELS_DIR" -name "*.lock" -type f -mmin +60 -delete 2>/dev/null || true
     rm -f /.provisioning
 }
@@ -63,7 +58,7 @@ script_error() {
     local exit_code=$?
     local line=$1
     log "[ERROR] Script failed at line $line (exit code $exit_code)"
-    exit $exit_code
+    exit "$exit_code"
 }
 
 trap script_cleanup EXIT
@@ -76,7 +71,7 @@ normalize_entry() {
 parse_env_array() {
     local var="$1"
     local value="${!var:-}"
-    if [[ -z "$value" ]]; then return; fi
+    [[ -z "$value" ]] && return
     local -a arr=()
     IFS=';' read -ra parts <<< "$value"
     for p in "${parts[@]}"; do
@@ -84,9 +79,7 @@ parse_env_array() {
         [[ -z "$p" || "$p" == \#* ]] && continue
         arr+=("$p")
     done
-    if [[ ${#arr[@]} -gt 0 ]]; then
-        printf '%s\0' "${arr[@]}"
-    fi
+    [[ ${#arr[@]} -gt 0 ]] && printf '%s\0' "${arr[@]}"
 }
 
 merge_with_env() {
@@ -94,17 +87,14 @@ merge_with_env() {
     shift
     local -a defaults=("$@")
     local -a result=()
-
     for d in "${defaults[@]}"; do
         d=$(normalize_entry "$d")
         [[ -z "$d" || "$d" == \#* ]] && continue
         result+=("$d")
     done
-
     while IFS= read -r -d '' e; do
         result+=("$e")
     done < <(parse_env_array "$var")
-
     printf '%s\0' "${result[@]}"
 }
 
@@ -127,8 +117,8 @@ acquire_slot() {
 release_slot() { rm -f "$1"; }
 
 download_file() {
-    local raw_urls="$1" dest="$2" auth_type="${3:-}"
-    local max_retries=15 base_delay=10
+    local raw_urls="$1" dest="$2"
+    local max_retries=12 base_delay=8
 
     IFS=' ' read -ra sources <<< "$raw_urls"
 
@@ -139,20 +129,15 @@ download_file() {
     mkdir -p "$out_dir"
 
     if [[ -f "$dest" && -s "$dest" ]]; then
-        log "Already exists and non-empty: $dest → skipping"
+        log "Already exists: $dest (skipping)"
         return 0
     fi
 
-    log "Starting download for $dest"
-    log "  Sources (${#sources[@]}): ${sources[*]}"
-    if [[ -n "${CIVITAI_TOKEN:-}" ]]; then
-        log "  CIVITAI_TOKEN is set (length ${#CIVITAI_TOKEN})"
-    else
-        log "  No CIVITAI_TOKEN detected"
-    fi
+    log "Starting download: $dest"
+    log "  Sources: ${sources[*]}"
+    [[ -n "${CIVITAI_TOKEN:-}" ]] && log "  CIVITAI_TOKEN detected (length ${#CIVITAI_TOKEN})"
 
-    local auth_header=""
-    local token_query=""
+    local auth_header="" token_query=""
     if [[ -n "${CIVITAI_TOKEN:-}" ]]; then
         auth_header="Authorization: Bearer $CIVITAI_TOKEN"
         token_query="?token=$CIVITAI_TOKEN"
@@ -167,36 +152,32 @@ download_file() {
             exit 1
         fi
 
-        local attempt_count=0
-        local source_idx=0
-        while (( attempt_count < max_retries * ${#sources[@]} )); do
-            local url_base="${sources[source_idx]}"
+        local src_idx=0 attempt_total=0
+        while (( attempt_total < max_retries * ${#sources[@]} )); do
+            local url_base="${sources[src_idx]}"
             local url="$url_base"
-            if [[ $url_base == *civitai* ]]; then
-                url="${url_base}${token_query}"
-            fi
+            [[ $url_base == *civitai* ]] && url="${url_base}${token_query}"
 
-            log "Trying source $((source_idx + 1))/${#sources[@] } : $url"
+            log "Trying source: $url"
 
             if curl -L --fail --retry 1 --retry-delay 2 \
                 --connect-timeout 60 --max-time 600 \
                 ${auth_header:+-H "$auth_header"} \
-                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                --no-progress-meter \
+                -A "Mozilla/5.0" --no-progress-meter \
                 -o "$dest.tmp" "$url"; then
 
                 mv "$dest.tmp" "$dest"
-                log "SUCCESS → $dest from $url"
+                log "SUCCESS → $dest"
                 exit 0
             fi
 
-            log "  Failed → cycling to next source after ${base_delay}s..."
+            log "  Failed — waiting ${base_delay}s then cycling source..."
             sleep $base_delay
-            ((attempt_count++))
-            ((source_idx = (source_idx + 1) % ${#sources[@]} ))
+            ((attempt_total++))
+            ((src_idx = (src_idx + 1) % ${#sources[@]} ))
         done
 
-        log "[FAIL] All sources cycled and failed for $dest after $attempt_count attempts"
+        log "[FAIL] All sources exhausted for $dest"
         exit 1
     ) 200>"$lock"
 
@@ -205,30 +186,12 @@ download_file() {
     return $rc
 }
 
-install_apt_packages() {
-    (( ${#APT_PACKAGES[@]} == 0 )) && return
-    log "Installing APT packages..."
-    sudo apt-get update -qq
-    sudo apt-get install -y --no-install-recommends "${APT_PACKAGES[@]}"
-}
-
-install_pip_packages() {
-    (( ${#PIP_PACKAGES[@]} == 0 )) && return
-    log "Installing pip packages..."
-    uv pip install --no-cache-dir "${PIP_PACKAGES[@]}"
-}
-
 install_extensions() {
     local -a exts=()
     while IFS= read -r -d '' e; do [[ -n "$e" ]] && exts+=("$e"); done < <(merge_with_env "EXTENSIONS" "${EXTENSIONS[@]}")
     (( ${#exts[@]} == 0 )) && return
 
-    log "Installing/updating ${#exts[@]} extension(s)..."
-
-    export GIT_CONFIG_GLOBAL=/tmp/git-safe
-    echo "[safe]" > "$GIT_CONFIG_GLOBAL"
-    echo "    directory = *" >> "$GIT_CONFIG_GLOBAL"
-
+    log "Installing ${#exts[@]} extension(s)..."
     local d="${FORGE_DIR}/extensions"
     mkdir -p "$d"
 
@@ -237,23 +200,21 @@ install_extensions() {
             local name=$(basename "${url%.git}")
             local tgt="$d/$name"
             if [[ -d "$tgt/.git" ]]; then
-                log "  Updating $name"
-                (cd "$tgt" && git pull --quiet) || log "  [WARN] pull failed: $name"
+                (cd "$tgt" && git pull --quiet) || log "  [WARN] Update failed: $name"
             else
-                log "  Cloning $name"
-                git clone --quiet --depth 1 "$url" "$tgt" || log "  [WARN] clone failed: $name"
+                git clone --quiet --depth 1 "$url" "$tgt" || log "  [WARN] Clone failed: $name"
             fi
         ) &
     done
     wait
 }
 
-install_civitai_models() {
+install_models() {
     local -a models=()
     while IFS= read -r -d '' m; do [[ -n "$m" ]] && models+=("$m"); done < <(merge_with_env "CIVITAI_MODELS" "${CIVITAI_MODELS_DEFAULT[@]}")
     (( ${#models[@]} == 0 )) && { log "No models configured"; return; }
 
-    log "Downloading ${#models[@]} model file(s) with source cycling..."
+    log "Downloading ${#models[@]} model(s) with source cycling..."
 
     for entry in "${models[@]}"; do
         IFS='|' read -r urls dest <<< "$entry"
@@ -261,10 +222,10 @@ install_civitai_models() {
         dest=$(normalize_entry "$dest")
         [[ -z "$urls" || -z "$dest" ]] && continue
 
-        if download_file "$urls" "$dest" "civitai" == 0; then
-            log "Model $dest downloaded successfully"
+        if download_file "$urls" "$dest"; then
+            log "✓ $dest downloaded"
         else
-            log "Failed all sources for $dest — abandoning and continuing to next alternative"
+            log "✗ Failed all sources for $dest — continuing to next model"
         fi
     done
 }
@@ -273,10 +234,8 @@ main() {
     mkdir -p "$SEMAPHORE_DIR"
     touch /.provisioning
 
-    install_apt_packages
-    install_pip_packages
     install_extensions
-    install_civitai_models
+    install_models
 
     log "Provisioning finished."
 }
