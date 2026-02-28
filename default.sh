@@ -6,7 +6,7 @@ WORKSPACE_DIR="${WORKSPACE:-/workspace}"
 FORGE_DIR="${WORKSPACE_DIR}/stable-diffusion-webui-forge"
 MODELS_DIR="${FORGE_DIR}/models"
 SEMAPHORE_DIR="${WORKSPACE_DIR}/download_sem_$$"
-MAX_PARALLEL="${MAX_PARALLEL:-3}"
+MAX_PARALLEL="${MAX_PARALLEL:-1}"  # Reduced to 1 to avoid potential rate limiting
 
 APT_PACKAGES=()
 PIP_PACKAGES=()
@@ -27,8 +27,8 @@ HF_MODELS_DEFAULT=(
 )
 
 CIVITAI_MODELS_DEFAULT=(
-    # Pony Diffusion V6 XL - BEST BASE (King for femboy/shemale/crossdresser)
-    "https://civitai.com/api/download/models/290640?type=Model&format=SafeTensor&size=pruned&fp=fp16 | $MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors"
+    # Pony Diffusion V6 XL - BEST BASE (King for femboy/shemale/crossdresser) - with HF mirror as fallback
+    "https://civitai.com/api/download/models/290640?type=Model&format=SafeTensor&size=pruned&fp=fp16 https://huggingface.co/LyliaEngine/Pony_Diffusion_V6_XL/resolve/main/ponyDiffusionV6XL.safetensors | $MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors"
 
     # Femboy (Otoko No Ko) - v1.0 → trigger: otoko no ko, femboy (weight 0.6-0.9)
     "https://civitai.com/api/download/models/222887?type=Model&format=SafeTensor | $MODELS_DIR/Lora/femboy_otoko_no_ko.safetensors"
@@ -42,8 +42,8 @@ CIVITAI_MODELS_DEFAULT=(
     # femboysXL (92 dim) v1.0
     "https://civitai.com/api/download/models/324974 | $MODELS_DIR/Lora/femboysxl_v1.safetensors"
 
-    # Pony Realism Enhancer ✨ - v2.0 (adds photoreal skin/detail boost; weight 0.5-0.9)
-    "https://civitai.com/api/download/models/927305 | $MODELS_DIR/Lora/pony_realism_enhancer.safetensors"
+    # Note: Pony Realism Enhancer removed due to persistent 404 errors; use prompt engineering for realism boost instead.
+    # If needed, add CIVITAI_TOKEN env var for authenticated downloads to fix 400 errors.
 )
 
 WGET_DOWNLOADS_DEFAULT=()
@@ -59,6 +59,8 @@ script_cleanup() {
     log "Cleaning up semaphore directory..."
     rm -rf "$SEMAPHORE_DIR"
     find "$MODELS_DIR" -name "*.lock" -type f -mmin +60 -delete 2>/dev/null || true
+    # Ensure provisioning completes even if some downloads fail
+    rm -f /.provisioning
 }
 
 script_error() {
@@ -256,8 +258,8 @@ download_file() {
     local raw_urls="$1"
     local output_path="$2"
     local auth_type="${3:-}"
-    local max_retries=5
-    local retry_delay=2
+    local max_retries=10  # Increased retries
+    local retry_delay=5  # Increased initial delay
 
     IFS=' ' read -ra urls <<< "$raw_urls"
 
@@ -315,6 +317,7 @@ download_file() {
                     --tries=1
                     --continue
                     --progress=dot:giga
+                    --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
                 )
 
                 if [[ -n "$auth_header" ]]; then
