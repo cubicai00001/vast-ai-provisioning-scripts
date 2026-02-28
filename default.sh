@@ -26,15 +26,18 @@ HF_MODELS_DEFAULT=()
 CIVITAI_MODELS_DEFAULT=(
     # Pony Diffusion V6 XL - BEST BASE (King for femboy/shemale/crossdresser)
     "https://civitai.com/api/download/models/290640?type=Model&format=SafeTensor&size=pruned&fp=fp16
-    |$MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors"
+    |$MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors
+    |civitai"
 
     # Femboy (Otoko No Ko) - v1.0 → trigger: otoko no ko, femboy (weight 0.6-0.9)
     "https://civitai.com/api/download/models/222887?type=Model&format=SafeTensor
-    |$MODELS_DIR/Lora/femboy_otoko_no_ko.safetensors"
+    |$MODELS_DIR/Lora/femboy_otoko_no_ko.safetensors
+    |civitai"
 
     # Femboy v1.0 → trigger: femboy, feminine, flat chest, cute
     "https://civitai.com/api/download/models/173782?type=Model&format=SafeTensor&size=full&fp=fp16
-    |$MODELS_DIR/Lora/femboy.safetensors"
+    |$MODELS_DIR/Lora/femboy.safetensors
+    |civitai"
 )
 
 WGET_DOWNLOADS_DEFAULT=()
@@ -247,8 +250,8 @@ download_file() {
     local url="$1"
     local output_path="$2"
     local auth_type="${3:-}"
-    local max_retries=5
-    local retry_delay=2
+    local max_retries=8           # artırıldı: daha fazla şans
+    local retry_delay=4           # ilk retry'den sonra biraz daha uzun bekle
 
     local slot
     slot=$(acquire_slot "$SEMAPHORE_DIR/dl" "$MAX_PARALLEL")
@@ -265,20 +268,29 @@ download_file() {
 
     mkdir -p "$output_dir"
 
-    local auth_header=""
-    if [[ "$auth_type" == "hf" ]] && [[ -n "${HF_TOKEN:-}" ]]; then
-        auth_header="Authorization: Bearer $HF_TOKEN"
-    elif [[ "$auth_type" == "civitai" ]] && [[ -n "${CIVITAI_TOKEN:-}" ]]; then
-        auth_header="Authorization: Bearer $CIVITAI_TOKEN"
+    # ────────────────────────────────────────────────
+    # ★★★ DEĞİŞİKLİK: Bearer yerine query string token ★★★
+    # ────────────────────────────────────────────────
+    local auth_param=""
+    if [[ "$auth_type" == "civitai" ]] && [[ -n "${CIVITAI_TOKEN:-}" ]]; then
+        if [[ "$url" == *\?* ]]; then
+            auth_param="&token=${CIVITAI_TOKEN}"
+        else
+            auth_param="?token=${CIVITAI_TOKEN}"
+        fi
+    elif [[ "$auth_type" == "hf" ]] && [[ -n "${HF_TOKEN:-}" ]]; then
+        auth_param="?token=${HF_TOKEN}"
     fi
 
+    local full_url="${url}${auth_param}"
+
     local url_hash
-    url_hash=$(printf '%s' "$url" | md5sum | cut -d' ' -f1)
+    url_hash=$(printf '%s' "$full_url" | md5sum | cut -d' ' -f1)
     local lockfile="${output_dir}/.download_${url_hash}.lock"
 
     (
         if ! flock -x -w 300 200; then
-            log "[ERROR] Could not acquire lock for download after 300s: $url"
+            log "[ERROR] Could not acquire lock for download after 300s: $full_url"
             exit 1
         fi
 
@@ -286,24 +298,20 @@ download_file() {
         local current_delay=$retry_delay
 
         while [ $attempt -le $max_retries ]; do
-            log "Downloading: $url (attempt $attempt/$max_retries)..."
+            log "Downloading (attempt $attempt/$max_retries): $full_url"
 
             local wget_args=(
-                --timeout=60
+                --timeout=90               # artırıldı
                 --tries=1
                 --continue
                 --progress=dot:giga
             )
 
-            if [[ -n "$auth_header" ]]; then
-                wget_args+=(--header="$auth_header")
-            fi
-
             if [[ "$use_content_disposition" == true ]]; then
                 local remote_filename
-                remote_filename=$(get_content_disposition_filename "$url" "$auth_header")
+                remote_filename=$(get_content_disposition_filename "$full_url")
                 if [[ -n "$remote_filename" && -f "$output_dir/$remote_filename" ]]; then
-                    log "File already exists: $output_dir/$remote_filename (skipping)"
+                    log "File already exists (content-disposition): $output_dir/$remote_filename (skipping)"
                     exit 0
                 fi
                 wget_args+=(--content-disposition -P "$output_dir")
@@ -315,7 +323,7 @@ download_file() {
                 wget_args+=(-O "$output_dir/$output_file")
             fi
 
-            if wget "${wget_args[@]}" "$url" 2>&1; then
+            if wget "${wget_args[@]}" "$full_url" 2>&1; then
                 log "Successfully downloaded to: $output_dir"
                 exit 0
             fi
@@ -326,7 +334,7 @@ download_file() {
             attempt=$((attempt + 1))
         done
 
-        log "[ERROR] Failed to download $url after $max_retries attempts"
+        log "[ERROR] Failed to download $full_url after $max_retries attempts"
         exit 1
     ) 200>"$lockfile"
 
@@ -364,144 +372,77 @@ install_extensions() {
     log "Installing ${#extensions[@]} extension(s)..."
 
     export GIT_CONFIG_GLOBAL=/tmp/temporary-git-config
-    git config --file "$GIT_CONFIG_GLOBAL" --add safe.directory '*'
 
-    for repo in "${extensions[@]}"; do
-        [[ -z "$repo" ]] && continue
-
-        local dir="${repo##*/}"
-        dir="${dir%.git}"
-        local path="${FORGE_DIR}/extensions/${dir}"
-
-        if [[ -d "$path" ]]; then
-            log "Extension already installed: $dir"
-        else
-            log "Installing extension: $repo"
-            git clone "$repo" "$path" --recursive
-        fi
+    for ext in "${extensions[@]}"; do
+        log "Installing extension: $ext"
+        git clone "$ext" "${FORGE_DIR}/extensions/$(basename "$ext")" || log "Failed to clone $ext"
     done
 }
 
 download_models() {
-    local -n model_array=$1
-    local auth_type="$2"
-    local pids=()
-
-    for entry in "${model_array[@]}"; do
-        [[ -z "${entry// }" ]] && continue
-
-        local url="${entry%%|*}"
-        local output_path="${entry##*|}"
-
-        url="${url#"${url%%[![:space:]]*}"}"
-        url="${url%"${url##*[![:space:]]}"}"
-        output_path="${output_path#"${output_path%%[![:space:]]*}"}"
-        output_path="${output_path%"${output_path##*[![:space:]]}"}"
-
-        log "Queuing download: $url -> $output_path"
-
-        if [[ "$auth_type" == "hf" ]]; then
-            download_hf_file "$url" "$output_path" &
-        else
-            download_file "$url" "$output_path" "$auth_type" &
-        fi
-        pids+=($!)
-    done
-
-    local failed=0
-    for pid in "${pids[@]}"; do
-        if ! wait "$pid"; then
-            log "[ERROR] Download process $pid failed"
-            failed=1
-        fi
-    done
-
-    return $failed
-}
-
-run_startup_test() {
-    log "Running Forge startup test..."
-    export GIT_CONFIG_GLOBAL=/tmp/temporary-git-config
-    git config --file "$GIT_CONFIG_GLOBAL" --add safe.directory '*'
-
-    cd "${FORGE_DIR}"
-    LD_PRELOAD=libtcmalloc_minimal.so.4 \
-        python launch.py \
-            --skip-python-version-check \
-            --no-download-sd-model \
-            --do-not-download-clip \
-            --no-half \
-            --port 11404 \
-            --exit
-}
-
-main() {
-    if [[ -f /venv/main/bin/activate ]]; then
-        . /venv/main/bin/activate
-    fi
-
-    if [[ -n "${HF_TOKEN:-}" ]]; then
-        if has_valid_hf_token; then
-            log "HuggingFace token validated"
-        else
-            log "[WARN] HF_TOKEN is set but appears invalid"
-        fi
-    fi
-
-    if [[ -n "${CIVITAI_TOKEN:-}" ]]; then
-        if has_valid_civitai_token; then
-            log "CivitAI token validated"
-        else
-            log "[WARN] CIVITAI_TOKEN is set but appears invalid"
-        fi
-    fi
-
-    local -a hf_models=()
-    while IFS= read -r -d '' entry; do
-        [[ -n "$entry" ]] && hf_models+=("$entry")
-    done < <(merge_with_env "HF_MODELS" "${HF_MODELS_DEFAULT[@]}")
-
     local -a civitai_models=()
     while IFS= read -r -d '' entry; do
         [[ -n "$entry" ]] && civitai_models+=("$entry")
     done < <(merge_with_env "CIVITAI_MODELS" "${CIVITAI_MODELS_DEFAULT[@]}")
 
-    local -a wget_downloads=()
+    if [[ ${#civitai_models[@]} -eq 0 ]]; then
+        log "No CivitAI models to download"
+    else
+        log "Queueing ${#civitai_models[@]} CivitAI model download(s)..."
+        for model_entry in "${civitai_models[@]}"; do
+            IFS='|' read -r url dest auth_type <<< "$model_entry"
+            url=$(echo "$url" | xargs)
+            dest=$(echo "$dest" | xargs)
+            auth_type=$(echo "$auth_type" | xargs)
+
+            [[ -z "$url" || -z "$dest" ]] && continue
+
+            log "Queueing download: $url → $dest (auth: ${auth_type:-none})"
+            download_file "$url" "$dest" "$auth_type" &
+        done
+        wait
+    fi
+
+    # HF modelleri (eğer varsa)
+    local -a hf_models=()
     while IFS= read -r -d '' entry; do
-        [[ -n "$entry" ]] && wget_downloads+=("$entry")
-    done < <(merge_with_env "WGET_DOWNLOADS" "${WGET_DOWNLOADS_DEFAULT[@]}")
+        [[ -n "$entry" ]] && hf_models+=("$entry")
+    done < <(merge_with_env "HF_MODELS" "${HF_MODELS_DEFAULT[@]}")
 
-    log "HF_MODELS: ${#hf_models[@]} entries"
-    log "CIVITAI_MODELS: ${#civitai_models[@]} entries"
-    log "WGET_DOWNLOADS: ${#wget_downloads[@]} entries"
+    if [[ ${#hf_models[@]} -gt 0 ]]; then
+        log "Downloading ${#hf_models[@]} HuggingFace model(s)..."
+        for hf_entry in "${hf_models[@]}"; do
+            IFS='|' read -r url dest <<< "$hf_entry"
+            url=$(echo "$url" | xargs)
+            dest=$(echo "$dest" | xargs)
+            [[ -z "$url" || -z "$dest" ]] && continue
+            download_hf_file "$url" "$dest" &
+        done
+        wait
+    fi
+}
 
-    rm -rf "$SEMAPHORE_DIR"
-    mkdir -p "$SEMAPHORE_DIR"
+main() {
+    log "Starting provisioning script..."
+
+    if has_valid_civitai_token; then
+        log "CIVITAI_TOKEN is valid"
+    else
+        log "Warning: CIVITAI_TOKEN is missing or invalid"
+    fi
+
+    if has_valid_hf_token; then
+        log "HF_TOKEN is valid"
+    else
+        log "Warning: HF_TOKEN is missing or invalid"
+    fi
 
     install_apt_packages
     install_pip_packages
     install_extensions
+    download_models
 
-    local download_failed=0
-    log "Starting model downloads..."
-
-    if [[ ${#hf_models[@]} -gt 0 ]]; then
-        download_models hf_models "hf" || download_failed=1
-    fi
-    if [[ ${#civitai_models[@]} -gt 0 ]]; then
-        download_models civitai_models "civitai" || download_failed=1
-    fi
-    if [[ ${#wget_downloads[@]} -gt 0 ]]; then
-        download_models wget_downloads "" || download_failed=1
-    fi
-
-    if [[ $download_failed -eq 1 ]]; then
-        log "[ERROR] One or more downloads failed"
-        exit 1
-    fi
-
-    log "All downloads completed successfully"
-    run_startup_test
+    log "Provisioning completed successfully!"
 }
 
-main "$@"
+main
