@@ -25,10 +25,10 @@ EXTENSIONS=(
 HF_MODELS_DEFAULT=()
 
 CIVITAI_MODELS_DEFAULT=(
-    # Pony Diffusion V6 XL ─ Civitai first, HF mirror second
+    # Pony Diffusion V6 XL
     "https://civitai.com/api/download/models/290640?type=Model&format=SafeTensor&size=pruned&fp=fp16 https://huggingface.co/LyliaEngine/Pony_Diffusion_V6_XL/resolve/main/ponyDiffusionV6XL.safetensors | $MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors"
 
-    # Femboy (Otoko No Ko) v1.0 ─ only Civitai (no known good HF mirror)
+    # Femboy (Otoko No Ko) v1.0
     "https://civitai.com/api/download/models/222887?type=Model&format=SafeTensor | $MODELS_DIR/Lora/femboy_otoko_no_ko.safetensors"
 
     # Femboy v1.0
@@ -39,6 +39,16 @@ CIVITAI_MODELS_DEFAULT=(
 
     # femboysXL v1.0
     "https://civitai.com/api/download/models/324974 | $MODELS_DIR/Lora/femboysxl_v1.safetensors"
+
+    # Alternatives if primaries fail (added as extra downloads; UI can select)
+    # Male Mix (Pony) v5.0 - alternative for femboy/male types
+    "https://civitai.com/api/download/models/2625213?type=Model&format=SafeTensor | $MODELS_DIR/Lora/male_mix_pony.safetensors"
+
+    # Femboy pony v1.1 - alternative femboy body LoRA
+    "https://civitai.com/api/download/models/1861600?type=Model&format=SafeTensor | $MODELS_DIR/Lora/femboy_pony.safetensors"
+
+    # CurvyFemboyXL - alternative from HF
+    "https://huggingface.co/datasets/CollectorN01/PonyXL-Lora-MyAhhArchiveCN01/resolve/main/concept/CurvyFemboyXL.safetensors | $MODELS_DIR/Lora/curvy_femboy_xl.safetensors"
 )
 
 WGET_DOWNLOADS_DEFAULT=()
@@ -60,7 +70,7 @@ script_error() {
     local exit_code=$?
     local line=$1
     log "[ERROR] Script failed at line $line (exit code $exit_code)"
-    exit "$exit_code"
+    exit $exit_code
 }
 
 trap script_cleanup EXIT
@@ -140,7 +150,6 @@ download_file() {
         return 0
     fi
 
-    # ──────────────── Log test / debug info ────────────────
     log "Starting download for $dest"
     log "  Sources (${#sources[@]}): ${sources[*]}"
     if [[ -n "${CIVITAI_TOKEN:-}" ]]; then
@@ -148,7 +157,6 @@ download_file() {
     else
         log "  No CIVITAI_TOKEN detected"
     fi
-    # ───────────────────────────────────────────────────────
 
     local auth_header=""
     local token_query=""
@@ -166,15 +174,18 @@ download_file() {
             exit 1
         fi
 
+        local attempt_count=0
         for url_base in "${sources[@]}"; do
-            local url="${url_base}${token_query}"
+            local url="${url_base}${token_query if [[ $url_base == *civitai* ]]; }"
 
             log "Trying source: $url"
 
             local attempt=1 delay=$base_delay
 
             while (( attempt <= max_retries )); do
-                log "  Attempt $attempt/$max_retries"
+                ((attempt_count++))
+
+                log "  Attempt $attempt/$max_retries (total attempts $attempt_count)"
 
                 if curl -L --fail --retry 1 --retry-delay 2 \
                     --connect-timeout 60 --max-time 600 \
@@ -184,7 +195,7 @@ download_file() {
                     -o "$dest.tmp" "$url"; then
 
                     mv "$dest.tmp" "$dest"
-                    log "SUCCESS → $dest"
+                    log "SUCCESS → $dest from $url"
                     exit 0
                 fi
 
@@ -195,10 +206,10 @@ download_file() {
                 ((attempt++))
             done
 
-            log "  All $max_retries attempts failed for this source"
+            log "  All retries failed for $url — trying next source if available"
         done
 
-        log "[FAIL] No source succeeded for $dest"
+        log "[FAIL] All sources failed for $dest after $attempt_count attempts"
         exit 1
     ) 200>"$lock"
 
@@ -253,20 +264,23 @@ install_extensions() {
 install_civitai_models() {
     local -a models=()
     while IFS= read -r -d '' m; do [[ -n "$m" ]] && models+=("$m"); done < <(merge_with_env "CIVITAI_MODELS" "${CIVITAI_MODELS_DEFAULT[@]}")
-    (( ${#models[@]} == 0 )) && { log "No Civitai/HF models configured"; return; }
+    (( ${#models[@]} == 0 )) && { log "No models configured"; return; }
 
-    log "Downloading ${#models[@]} model file(s)..."
+    log "Downloading ${#models[@]} model file(s) sequentially with fallbacks..."
 
     for entry in "${models[@]}"; do
-        (
-            IFS='|' read -r urls dest <<< "$entry"
-            urls=$(normalize_entry "$urls")
-            dest=$(normalize_entry "$dest")
-            [[ -z "$urls" || -z "$dest" ]] && return
-            download_file "$urls" "$dest" "civitai"
-        ) &
+        IFS='|' read -r urls dest <<< "$entry"
+        urls=$(normalize_entry "$urls")
+        dest=$(normalize_entry "$dest")
+        [[ -z "$urls" || -z "$dest" ]] && continue
+
+        if download_file "$urls" "$dest" "civitai" == 0; then
+            log "Primary model $dest downloaded successfully"
+        else
+            log "Primary failed for $dest — trying alternatives if any"
+            # Here add logic for specific fallbacks, but since added to array, already tried
+        fi
     done
-    wait
 }
 
 main() {
