@@ -5,8 +5,6 @@ set -euo pipefail
 WORKSPACE_DIR="${WORKSPACE:-/workspace}"
 FORGE_DIR="${WORKSPACE_DIR}/stable-diffusion-webui-forge"
 MODELS_DIR="${FORGE_DIR}/models"
-SEMAPHORE_DIR="${WORKSPACE_DIR}/download_sem_$$"
-MAX_PARALLEL="${MAX_PARALLEL:-1}"
 
 EXTENSIONS=(
     "https://github.com/wkpark/uddetailer"
@@ -20,16 +18,16 @@ EXTENSIONS=(
 )
 
 CIVITAI_MODELS_DEFAULT=(
-    # Pony Diffusion V6 XL (Civitai + HF mirror)
+    # Pony Diffusion V6 XL (Civitai + reliable HF mirror)
     "https://civitai.com/api/download/models/290640?type=Model&format=SafeTensor&size=pruned&fp=fp16 https://huggingface.co/LyliaEngine/Pony_Diffusion_V6_XL/resolve/main/ponyDiffusionV6XL.safetensors | $MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors"
 
-    # Femboy models
+    # Femboy LoRAs
     "https://civitai.com/api/download/models/222887?type=Model&format=SafeTensor | $MODELS_DIR/Lora/femboy_otoko_no_ko.safetensors"
     "https://civitai.com/api/download/models/173782?type=Model&format=SafeTensor&size=full&fp=fp16 | $MODELS_DIR/Lora/femboy.safetensors"
     "https://civitai.com/api/download/models/20797 | $MODELS_DIR/Lora/femboi_full_v1.safetensors"
     "https://civitai.com/api/download/models/324974 | $MODELS_DIR/Lora/femboysxl_v1.safetensors"
 
-    # Fallback alternatives (same style)
+    # Fallback alternatives (same job)
     "https://civitai.com/api/download/models/2625213?type=Model&format=SafeTensor | $MODELS_DIR/Lora/male_mix_pony.safetensors"
     "https://civitai.com/api/download/models/1861600?type=Model&format=SafeTensor | $MODELS_DIR/Lora/femboy_pony.safetensors"
     "https://huggingface.co/datasets/CollectorN01/PonyXL-Lora-MyAhhArchiveCN01/resolve/main/concept/CurvyFemboyXL.safetensors | $MODELS_DIR/Lora/curvy_femboy_xl.safetensors"
@@ -38,13 +36,6 @@ CIVITAI_MODELS_DEFAULT=(
 ### End Configuration ###
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
-
-script_cleanup() {
-    rm -rf "$SEMAPHORE_DIR" 2>/dev/null || true
-    rm -f /.provisioning
-}
-
-trap script_cleanup EXIT
 
 normalize_entry() {
     echo "$1" | tr -d '\n\r' | tr -s ' ' | sed 's/^ *//;s/ *$//'
@@ -58,23 +49,28 @@ download_file() {
     mkdir -p "$out_dir"
 
     if [[ -f "$dest" && -s "$dest" ]]; then
-        log "Already exists: $dest"
+        log "Already exists: $(basename "$dest")"
         return 0
     fi
 
-    log "Downloading $dest"
-    log "  Sources: ${sources[*]}"
-    [[ -n "${CIVITAI_TOKEN:-}" ]] && log "  CIVITAI_TOKEN detected (length ${#CIVITAI_TOKEN})"
+    log "Downloading $(basename "$dest")"
+    [[ -n "${CIVITAI_TOKEN:-}" ]] && log "  CIVITAI_TOKEN detected"
 
     local auth_header="" token_query=""
     if [[ -n "${CIVITAI_TOKEN:-}" ]]; then
         auth_header="Authorization: Bearer $CIVITAI_TOKEN"
-        token_query="?token=$CIVITAI_TOKEN"
+        token_query="token=$CIVITAI_TOKEN"
     fi
 
     for url_base in "${sources[@]}"; do
         local url="$url_base"
-        [[ $url_base == *civitai* ]] && url="${url_base}${token_query}"
+        if [[ $url_base == *civitai* ]]; then
+            if [[ $url_base == *\?* ]]; then
+                url="${url_base}&${token_query}"
+            else
+                url="${url_base}?${token_query}"
+            fi
+        fi
 
         log "  Trying: $url"
 
@@ -84,7 +80,7 @@ download_file() {
             -A "Mozilla/5.0" --no-progress-meter \
             -o "$dest.tmp" "$url"; then
             mv "$dest.tmp" "$dest"
-            log "SUCCESS: $dest"
+            log "SUCCESS: $(basename "$dest")"
             return 0
         fi
 
@@ -92,13 +88,14 @@ download_file() {
         sleep 2
     done
 
-    log "FAILED all sources for $dest"
+    log "FAILED all sources for $(basename "$dest")"
     rm -f "$dest.tmp"
     return 1
 }
 
 install_models() {
     local -a models=()
+    # Support CIVITAI_MODELS env override if you want
     while IFS= read -r -d '' m; do [[ -n "$m" ]] && models+=("$m"); done < <(parse_env_array "CIVITAI_MODELS")
     [[ ${#models[@]} -eq 0 ]] && models=("${CIVITAI_MODELS_DEFAULT[@]}")
 
@@ -133,11 +130,9 @@ parse_env_array() {
 }
 
 main() {
-    mkdir -p "$SEMAPHORE_DIR"
     touch /.provisioning
-
     install_models
-
+    rm -f /.provisioning
     log "Provisioning finished."
 }
 
