@@ -36,14 +36,13 @@ download_model() {
         sleep 5
         ((attempt++))
     done
-    log "❌ Başarısız: $dest (manuel indirebilirsin)"
+    log "❌ Başarısız: $dest"
     return 1
 }
 
 main() {
     log "🚀 Provisioning başladı..."
 
-    # Extension'lar
     local exts=(
         "https://github.com/wkpark/uddetailer"
         "https://github.com/Coyote-A/ultimate-upscale-for-automatic1111"
@@ -51,37 +50,29 @@ main() {
         "https://github.com/Haoming02/sd-forge-ic-light"
         "https://github.com/zeittresor/sd-forge-fum"
         "https://github.com/jessearodriguez/sd-forge-regional-prompter"
-        "https://github.com/Gourieff/sd-webui-reactor"   # FaceswapLab alternatifi
+        "https://github.com/Gourieff/sd-webui-reactor"
     )
 
     for ext in "${exts[@]}"; do
         local name=$(basename "$ext")
-        if [[ -d "$FORGE_DIR/extensions/$name" ]]; then
-            log "✅ Zaten var: $name"
+        if [[ ! -d "$FORGE_DIR/extensions/$name" ]]; then
+            git clone "$ext" "$FORGE_DIR/extensions/$name" 2>/dev/null && log "✅ $name kuruldu" || log "⚠️ $name clone edilemedi"
         else
-            git clone "$ext" "$FORGE_DIR/extensions/$name" 2>/dev/null && log "✅ $name kuruldu" || log "⚠️ $name clone edilemedi (devam ediliyor)"
+            log "✅ Zaten var: $name"
         fi
     done
 
-    # Modeller
     log "Modeller indiriliyor..."
-    download_model "https://huggingface.co/LyliaEngine/Pony_Diffusion_V6_XL/resolve/main/ponyDiffusionV6XL.safetensors" \
-                   "$MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors" &
-
-    download_model "https://civitai.com/api/download/models/222887?type=Model&format=SafeTensor" \
-                   "$MODELS_DIR/Lora/femboy_otoko_no_ko.safetensors" "civitai" &
-
-    download_model "https://civitai.com/api/download/models/173782?type=Model&format=SafeTensor&size=full&fp=fp16" \
-                   "$MODELS_DIR/Lora/femboy.safetensors" "civitai" &
+    download_model "https://huggingface.co/LyliaEngine/Pony_Diffusion_V6_XL/resolve/main/ponyDiffusionV6XL.safetensors" "$MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors" &
+    download_model "https://civitai.com/api/download/models/222887?type=Model&format=SafeTensor" "$MODELS_DIR/Lora/femboy_otoko_no_ko.safetensors" "civitai" &
+    download_model "https://civitai.com/api/download/models/173782?type=Model&format=SafeTensor&size=full&fp=fp16" "$MODELS_DIR/Lora/femboy.safetensors" "civitai" &
 
     wait
 
-    # Her şey bitti → Forge'u serbest bırak
     log "✅ Tüm modeller hazır! Provisioning tamamlandı."
     rm -f "$PROVISIONING_FLAG"
     supervisorctl restart forge
-
-    log "🎉 WebUI artık kullanıma hazır!"
+    log "🎉 WebUI kullanıma hazır!"
 }
 
 main
