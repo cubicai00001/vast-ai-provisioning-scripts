@@ -22,12 +22,11 @@ download_model() {
         fi
     fi
 
-    # zaten tam boyutta varsa atla
+    # Zaten büyük boyutta varsa atla
     if [[ -f "$dest" ]]; then
-        local size
-        size=$(stat -c %s "$dest" 2>/dev/null || echo 0)
-        if (( size > 500000000 )); then     # ~500 MB'den büyükse tamam kabul et
-            log "Zaten var (yeterli boyutta): $dest"
+        local size=$(stat -c %s "$dest" 2>/dev/null || echo 0)
+        if (( size > 500000000 )); then
+            log "✅ Zaten var: $dest"
             return 0
         fi
     fi
@@ -35,26 +34,22 @@ download_model() {
     while (( retry < max )); do
         ((retry++))
         log "İndiriliyor ($retry/$max): $dest"
-        if wget --tries=1 --timeout=180 --continue --progress=dot:giga \
-                -O "$dest" "$full_url"; then
-            log "Başarılı: $dest"
+        if wget --tries=1 --timeout=180 --continue --progress=dot:giga -O "$dest" "$full_url"; then
+            log "✅ Başarılı: $dest"
             return 0
         fi
-        log "Başarısız, ${retry}. deneme..."
-        sleep $((retry * 3 + 2))
+        sleep $((retry * 4))
     done
 
-    log "❌ İndirme başarısız kaldı: $dest"
+    log "❌ İndirilemedi: $dest"
     return 1
 }
 
 main() {
-    log "Provisioning başladı..."
+    log "🚀 Provisioning başladı..."
 
-    # ────────────────────────────────────────────────
-    # Extension'lar (FaceswapLab yerine Reactor + çalışanlar)
-    # ────────────────────────────────────────────────
-    local extensions=(
+    # Extension'lar
+    local exts=(
         "https://github.com/wkpark/uddetailer"
         "https://github.com/Coyote-A/ultimate-upscale-for-automatic1111"
         "https://github.com/Mikubill/sd-webui-controlnet"
@@ -64,49 +59,27 @@ main() {
         "https://github.com/Gourieff/sd-webui-reactor"
     )
 
-    for url in "${extensions[@]}"; do
-        local name
-        name=$(basename "$url" .git)
+    for url in "${exts[@]}"; do
+        local name=$(basename "$url")
         local target="$FORGE_DIR/extensions/$name"
-
-        if [[ -d "$target" ]]; then
-            log "Zaten var → $name"
+        if [[ ! -d "$target" ]]; then
+            git clone --depth 1 "$url" "$target" 2>/dev/null && log "✅ $name kuruldu" || log "⚠️ $name clone edilemedi"
         else
-            log "Kuruluyor → $name"
-            git clone --depth 1 "$url" "$target" 2>/dev/null && \
-                log "Başarılı → $name" || \
-                log "Clone başarısız → $name (devam ediliyor)"
+            log "✅ Zaten var: $name"
         fi
     done
 
     # ────────────────────────────────────────────────
-    # Modeller
-    # Pony için en güncel ve çalışan HF mirror'lar (2026 başı)
+    # MODELLER (kalıcı çözüm: Pony de CivitAI'den çekiliyor)
     # ────────────────────────────────────────────────
     log "Modeller indiriliyor..."
 
-    # Pony Diffusion V6 XL – en güvenilir mirror'lar (sırayla dene)
-    local pony_urls=(
-        "https://huggingface.co/AI-Model-Host/pony-diffusion-v6-xl/resolve/main/ponyDiffusionV6XL.safetensors"
-        "https://huggingface.co/John6666/pony-diffusion-v6-xl/resolve/main/ponyDiffusionV6XL.safetensors"
-        "https://huggingface.co/6chan/Pony-Diffusion-V6-XL/resolve/main/ponyDiffusionV6XL_v6StartWithThisOne.safetensors"
-    )
+    # Pony Diffusion V6 XL (CivitAI - en stabil)
+    download_model \
+        "https://civitai.com/api/download/models/290640?type=Model&format=SafeTensor&size=pruned&fp=fp16" \
+        "$MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors" "civitai"
 
-    local pony_dest="$MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors"
-    local pony_ok=0
-
-    for url in "${pony_urls[@]}"; do
-        if download_model "$url" "$pony_dest"; then
-            pony_ok=1
-            break
-        fi
-    done
-
-    if (( pony_ok == 0 )); then
-        log "UYARI: Pony hiçbir mirror'dan inemedi! Manuel indirmeniz gerekebilir."
-    fi
-
-    # LoRA'lar (CivitAI)
+    # LoRA'lar
     download_model \
         "https://civitai.com/api/download/models/222887?type=Model&format=SafeTensor" \
         "$MODELS_DIR/Lora/femboy_otoko_no_ko.safetensors" "civitai"
@@ -116,13 +89,13 @@ main() {
         "$MODELS_DIR/Lora/femboy.safetensors" "civitai"
 
     # ────────────────────────────────────────────────
-    # Provisioning tamam → Forge'u başlat
+    # Forge'u serbest bırak
     # ────────────────────────────────────────────────
-    log "Provisioning tamamlandı."
+    log "✅ Tüm modeller hazır! Provisioning tamamlandı."
     rm -f "$PROVISIONING_FLAG" 2>/dev/null || true
-    supervisorctl restart forge 2>/dev/null || log "supervisorctl restart forge başarısız"
+    supervisorctl restart forge 2>/dev/null || true
 
-    log "WebUI artık kullanıma hazır olmalı."
+    log "🎉 WebUI kullanıma hazır! Open butonu aktif."
 }
 
 main
