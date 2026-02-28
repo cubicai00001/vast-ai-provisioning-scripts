@@ -22,7 +22,6 @@ download_model() {
         fi
     fi
 
-    # Zaten büyük boyutta varsa atla
     if [[ -f "$dest" ]]; then
         local size=$(stat -c %s "$dest" 2>/dev/null || echo 0)
         if (( size > 500000000 )); then
@@ -40,7 +39,6 @@ download_model() {
         fi
         sleep $((retry * 4))
     done
-
     log "❌ İndirilemedi: $dest"
     return 1
 }
@@ -69,17 +67,13 @@ main() {
         fi
     done
 
-    # ────────────────────────────────────────────────
-    # MODELLER (kalıcı çözüm: Pony de CivitAI'den çekiliyor)
-    # ────────────────────────────────────────────────
+    # Modeller
     log "Modeller indiriliyor..."
 
-    # Pony Diffusion V6 XL (CivitAI - en stabil)
     download_model \
         "https://civitai.com/api/download/models/290640?type=Model&format=SafeTensor&size=pruned&fp=fp16" \
         "$MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors" "civitai"
 
-    # LoRA'lar
     download_model \
         "https://civitai.com/api/download/models/222887?type=Model&format=SafeTensor" \
         "$MODELS_DIR/Lora/femboy_otoko_no_ko.safetensors" "civitai"
@@ -88,14 +82,11 @@ main() {
         "https://civitai.com/api/download/models/173782?type=Model&format=SafeTensor&size=full&fp=fp16" \
         "$MODELS_DIR/Lora/femboy.safetensors" "civitai"
 
-    # ────────────────────────────────────────────────
-    # Forge'u serbest bırak
-    # ────────────────────────────────────────────────
     log "✅ Tüm modeller hazır! Provisioning tamamlandı."
     rm -f "$PROVISIONING_FLAG" 2>/dev/null || true
     supervisorctl restart forge 2>/dev/null || true
 
-    log "🎉 WebUI kullanıma hazır! Open butonu aktif."
+    log "🎉 WebUI kullanıma hazır!"
 }
 
 main
