@@ -24,10 +24,10 @@ EXTENSIONS=(
 
 # ONLY PonyXL-compatible models (no SD 1.5 LoRAs → zero shape errors)
 CIVITAI_MODELS_DEFAULT=(
-    # Base - Pony Diffusion V6 XL (HF primary + Civitai fallback)
+    # Base - Pony Diffusion V6 XL (HF primary + Civitai fallback) - needs large min_size
     "https://huggingface.co/LyliaEngine/Pony_Diffusion_V6_XL/resolve/main/ponyDiffusionV6XL.safetensors https://civitai.com/api/download/models/290640?type=Model&format=SafeTensor&size=pruned&fp=fp16 | $MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors"
 
-    # PonyXL Femboy LoRAs (all confirmed compatible)
+    # PonyXL Femboy LoRAs (all confirmed compatible) - small files
     "https://civitai.com/api/download/models/324974 | $MODELS_DIR/Lora/femboysxl_v1.safetensors"
     "https://civitai.com/api/download/models/2625213?type=Model&format=SafeTensor | $MODELS_DIR/Lora/male_mix_pony.safetensors"
     "https://huggingface.co/datasets/CollectorN01/PonyXL-Lora-MyAhhArchiveCN01/resolve/main/concept/CurvyFemboyXL.safetensors | $MODELS_DIR/Lora/curvy_femboy_xl.safetensors"
@@ -105,11 +105,11 @@ acquire_slot() {
 
 release_slot() { rm -f "$1"; }
 
-# === ROBUST DOWNLOAD (latest improvements) ===
+# === ROBUST DOWNLOAD (improved: optional min_size, better logging on failure) ===
 download_file() {
     local raw_urls="$1"
     local output_path="$2"
-    local min_size="${3:-100000000}"   # 100 MB default minimum
+    local min_size="${3:-50000000}"   # Default 50 MB - safe for LoRAs; override for base model
 
     local slot
     slot=$(acquire_slot "$SEMAPHORE_DIR/dl" "$MAX_PARALLEL")
@@ -122,7 +122,7 @@ download_file() {
     for url in "${urls[@]}"; do
         local attempt=1
         while [ $attempt -le 5 ]; do
-            log "Downloading (attempt $attempt/5): $(basename "$output_path")"
+            log "Downloading (attempt $attempt/5): $(basename "$output_path") from $url"
 
             rm -f "$output_path.tmp"
 
@@ -133,17 +133,24 @@ download_file() {
                 wget_args+=(--header="Authorization: Bearer $HF_TOKEN")
             fi
 
-            if wget "${wget_args[@]}" "$url" -O "$output_path.tmp" && \
-               [ -s "$output_path.tmp" ] && [ $(stat -c %s "$output_path.tmp") -ge "$min_size" ]; then
-                
-                mv "$output_path.tmp" "$output_path"
-                log "✓ SUCCESS: $(basename "$output_path") ($(numfmt --to=iec $(stat -c %s "$output_path")))"
-                return 0
+            if wget "${wget_args[@]}" "$url" -O "$output_path.tmp"; then
+                local actual_size=$(stat -c %s "$output_path.tmp" 2>/dev/null || echo 0)
+                log "Downloaded temp file size: $(numfmt --to=iec $actual_size)"
+
+                if [ "$actual_size" -gt 0 ] && [ "$actual_size" -ge "$min_size" ]; then
+                    mv "$output_path.tmp" "$output_path"
+                    log "✓ SUCCESS: $(basename "$output_path") ($(numfmt --to=iec $actual_size))"
+                    return 0
+                else
+                    log "✗ Temp file too small ($actual_size bytes < $min_size required) - retrying"
+                fi
+            else
+                log "✗ wget failed (exit code $?)"
             fi
 
-            log "✗ Failed (retrying in 8s...)"
             rm -f "$output_path.tmp"
-            sleep 8
+            log "Retrying in 10s..."
+            sleep 10
             attempt=$((attempt + 1))
         done
     done
@@ -188,7 +195,16 @@ install_civitai_models() {
             IFS='|' read -r urls path <<< "$entry"
             urls=$(normalize_entry "$urls")
             path=$(normalize_entry "$path")
-            [[ -n "$urls" && -n "$path" ]] && download_file "$urls" "$path" 6500000000   # 6.5 GB min for base model
+            [[ -z "$urls" || -z "$path" ]] && return
+
+            local min_size=50000000  # default for LoRAs
+
+            # Special case: base model needs large min_size
+            if [[ "$path" == *ponyDiffusionV6XL.safetensors ]]; then
+                min_size=6500000000
+            fi
+
+            download_file "$urls" "$path" "$min_size"
         ) &
     done
     wait
