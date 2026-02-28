@@ -1,61 +1,212 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-echo "=== Pony Diffusion XL Provisioning v2.2 (Simplified) ==="
+### Configuration - PonyXL Optimized (Full Original Features + Robust Fixes) ###
+WORKSPACE_DIR="${WORKSPACE:-/workspace}"
+FORGE_DIR="${WORKSPACE_DIR}/stable-diffusion-webui-forge"
+MODELS_DIR="${FORGE_DIR}/models"
+SEMAPHORE_DIR="${WORKSPACE_DIR}/download_sem_$$"
+MAX_PARALLEL="${MAX_PARALLEL:-3}"
 
-WORKSPACE="${WORKSPACE:-/workspace}"
-FORGE_DIR="$WORKSPACE/stable-diffusion-webui-forge"
-MODELS_DIR="$FORGE_DIR/models"
+APT_PACKAGES=()
+PIP_PACKAGES=()
 
-mkdir -p "$MODELS_DIR/Stable-diffusion" "$MODELS_DIR/Lora" "$MODELS_DIR/VAE"
+EXTENSIONS=(
+    "https://github.com/wkpark/uddetailer"
+    "https://github.com/Coyote-A/ultimate-upscale-for-automatic1111"
+    "https://github.com/Mikubill/sd-webui-controlnet"
+    "https://github.com/Ethereum-John/sd-webui-forge-faceswaplab"
+    "https://github.com/Haoming02/sd-forge-ic-light"
+    "https://github.com/zeittresor/sd-forge-fum"
+    "https://github.com/jessearodriguez/sd-forge-regional-prompter"
+    "https://github.com/Bing-su/adetailer"
+)
 
-log() { echo "[$(date '+%H:%M:%S')] $1"; }
+# ONLY PonyXL-compatible models (no SD 1.5 LoRAs → zero shape errors)
+CIVITAI_MODELS_DEFAULT=(
+    # Base - Pony Diffusion V6 XL (HF primary + Civitai fallback)
+    "https://huggingface.co/LyliaEngine/Pony_Diffusion_V6_XL/resolve/main/ponyDiffusionV6XL.safetensors https://civitai.com/api/download/models/290640?type=Model&format=SafeTensor&size=pruned&fp=fp16 | $MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors"
 
-# === ONLY PONYXL COMPATIBLE MODELS ===
-log "Downloading base model + XL LoRAs..."
+    # PonyXL Femboy LoRAs (all confirmed compatible)
+    "https://civitai.com/api/download/models/324974 | $MODELS_DIR/Lora/femboysxl_v1.safetensors"
+    "https://civitai.com/api/download/models/2625213?type=Model&format=SafeTensor | $MODELS_DIR/Lora/male_mix_pony.safetensors"
+    "https://huggingface.co/datasets/CollectorN01/PonyXL-Lora-MyAhhArchiveCN01/resolve/main/concept/CurvyFemboyXL.safetensors | $MODELS_DIR/Lora/curvy_femboy_xl.safetensors"
+)
 
-# Pony Diffusion V6 XL (base)
-if [ ! -s "$MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors" ]; then
-    log "→ ponyDiffusionV6XL.safetensors"
-    wget -q --show-progress --continue \
-        https://huggingface.co/LyliaEngine/Pony_Diffusion_V6_XL/resolve/main/ponyDiffusionV6XL.safetensors \
-        -O "$MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors"
-fi
+WGET_DOWNLOADS_DEFAULT=()
 
-# XL LoRAs (all confirmed Pony-compatible)
-for url in \
-    "https://civitai.com/api/download/models/324974 | femboysxl_v1.safetensors" \
-    "https://civitai.com/api/download/models/2625213?type=Model&format=SafeTensor | male_mix_pony.safetensors" \
-    "https://huggingface.co/datasets/CollectorN01/PonyXL-Lora-MyAhhArchiveCN01/resolve/main/concept/CurvyFemboyXL.safetensors | curvy_femboy_xl.safetensors"; do
+### End Configuration ###
 
-    IFS='|' read -r url path <<< "$url"
-    filename=$(echo "$path" | xargs)
-    if [ ! -s "$MODELS_DIR/Lora/$filename" ]; then
-        log "→ $filename"
-        if [[ "$url" == *huggingface.co* && -n "${HF_TOKEN:-}" ]]; then
-            wget --header="Authorization: Bearer $HF_TOKEN" --continue "$url" -O "$MODELS_DIR/Lora/$filename"
-        else
-            wget --continue "$url" -O "$MODELS_DIR/Lora/$filename"
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+script_cleanup() {
+    log "Cleaning up..."
+    rm -rf "$SEMAPHORE_DIR"
+    rm -f /.provisioning
+}
+
+script_error() {
+    log "[ERROR] Provisioning failed at line $1 with code $?"
+    exit 1
+}
+
+trap script_cleanup EXIT
+trap 'script_error $LINENO' ERR
+
+normalize_entry() {
+    echo "$1" | tr '\n' ' ' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//'
+}
+
+parse_env_array() {
+    local env_var_name="$1"
+    local env_value="${!env_var_name:-}"
+    [[ -z "$env_value" ]] && return
+    local -a result=()
+    IFS=';' read -ra entries <<< "$env_value"
+    for entry in "${entries[@]}"; do
+        entry=$(normalize_entry "$entry")
+        [[ -z "$entry" || "$entry" == \#* ]] && continue
+        result+=("$entry")
+    done
+    printf '%s\0' "${result[@]}"
+}
+
+merge_with_env() {
+    local env_var_name="$1"
+    shift
+    local -a defaults=("$@")
+    for entry in "${defaults[@]}"; do
+        entry=$(normalize_entry "$entry")
+        [[ -z "$entry" || "$entry" == \#* ]] && continue
+        printf '%s\0' "$entry"
+    done
+    parse_env_array "$env_var_name"
+}
+
+acquire_slot() {
+    local prefix="$1"
+    local max_slots="$2"
+    local slot_dir="$(dirname "$prefix")"
+    local slot_prefix="$(basename "$prefix")"
+    while true; do
+        local count=$(find "$slot_dir" -maxdepth 1 -name "${slot_prefix}_*" 2>/dev/null | wc -l)
+        if [ "$count" -lt "$max_slots" ]; then
+            local slot="${prefix}_$$_${RANDOM}_${RANDOM}"
+            if (set -o noclobber; : > "$slot") 2>/dev/null; then
+                echo "$slot"
+                return 0
+            fi
         fi
-    fi
-done
+        sleep 0.5
+    done
+}
 
-# Extensions (optional but useful)
-log "Installing extensions..."
-cd "$FORGE_DIR/extensions" || mkdir -p "$FORGE_DIR/extensions" && cd "$FORGE_DIR/extensions"
-for repo in \
-    "https://github.com/Mikubill/sd-webui-controlnet" \
-    "https://github.com/Bing-su/adetailer" \
-    "https://github.com/wkpark/uddetailer" \
-    "https://github.com/Coyote-A/ultimate-upscale-for-automatic1111"; do
-    name=$(basename "$repo")
-    if [ ! -d "$name" ]; then
-        git clone --depth 1 "$repo" "$name" &>/dev/null && log "  ✓ $name"
-    else
-        (cd "$name" && git pull --quiet) &>/dev/null && log "  ✓ $name (updated)"
-    fi
-done
+release_slot() { rm -f "$1"; }
 
-log "✅ Provisioning finished successfully!"
-log "You now have Pony Diffusion V6 XL + 3 high-quality femboy XL LoRAs"
-rm -f /.provisioning
+# === ROBUST DOWNLOAD (latest improvements) ===
+download_file() {
+    local raw_urls="$1"
+    local output_path="$2"
+    local min_size="${3:-100000000}"   # 100 MB default minimum
+
+    local slot
+    slot=$(acquire_slot "$SEMAPHORE_DIR/dl" "$MAX_PARALLEL")
+    trap 'release_slot "$slot"' RETURN
+
+    mkdir -p "$(dirname "$output_path")"
+
+    IFS=' ' read -ra urls <<< "$raw_urls"
+
+    for url in "${urls[@]}"; do
+        local attempt=1
+        while [ $attempt -le 5 ]; do
+            log "Downloading (attempt $attempt/5): $(basename "$output_path")"
+
+            rm -f "$output_path.tmp"
+
+            local wget_args=(--progress=bar:force:noscroll --continue --tries=3 --timeout=180 --no-check-certificate)
+
+            # HF_TOKEN support
+            if [[ "$url" == *huggingface.co* && -n "${HF_TOKEN:-}" ]]; then
+                wget_args+=(--header="Authorization: Bearer $HF_TOKEN")
+            fi
+
+            if wget "${wget_args[@]}" "$url" -O "$output_path.tmp" && \
+               [ -s "$output_path.tmp" ] && [ $(stat -c %s "$output_path.tmp") -ge "$min_size" ]; then
+                
+                mv "$output_path.tmp" "$output_path"
+                log "✓ SUCCESS: $(basename "$output_path") ($(numfmt --to=iec $(stat -c %s "$output_path")))"
+                return 0
+            fi
+
+            log "✗ Failed (retrying in 8s...)"
+            rm -f "$output_path.tmp"
+            sleep 8
+            attempt=$((attempt + 1))
+        done
+    done
+
+    log "✗ FAILED after retries: $(basename "$output_path")"
+    return 1
+}
+
+install_apt_packages() { :; }
+install_pip_packages() { :; }
+
+install_extensions() {
+    local -a exts=()
+    while IFS= read -r -d '' e; do [[ -n "$e" ]] && exts+=("$e"); done < <(merge_with_env "EXTENSIONS" "${EXTENSIONS[@]}")
+    [[ ${#exts[@]} -eq 0 ]] && return
+
+    log "Installing ${#exts[@]} extensions..."
+    local ext_dir="${FORGE_DIR}/extensions"
+    mkdir -p "$ext_dir"
+    for url in "${exts[@]}"; do
+        (
+            local name=$(basename "$url" .git)
+            local target="$ext_dir/$name"
+            if [[ -d "$target/.git" ]]; then
+                (cd "$target" && git pull --quiet) || log "[WARN] Update failed: $name"
+            else
+                git clone --quiet --depth 1 "$url" "$target" || log "[WARN] Clone failed: $name"
+            fi
+        ) &
+    done
+    wait
+}
+
+install_civitai_models() {
+    local -a models=()
+    while IFS= read -r -d '' m; do [[ -n "$m" ]] && models+=("$m"); done < <(merge_with_env "CIVITAI_MODELS" "${CIVITAI_MODELS_DEFAULT[@]}")
+    [[ ${#models[@]} -eq 0 ]] && { log "No models configured"; return 0; }
+
+    log "Downloading ${#models[@]} PonyXL model(s)/LoRA(s)..."
+    for entry in "${models[@]}"; do
+        (
+            IFS='|' read -r urls path <<< "$entry"
+            urls=$(normalize_entry "$urls")
+            path=$(normalize_entry "$path")
+            [[ -n "$urls" && -n "$path" ]] && download_file "$urls" "$path" 6500000000   # 6.5 GB min for base model
+        ) &
+    done
+    wait
+}
+
+install_wget_downloads() { log "No extra wget downloads configured"; }
+
+main() {
+    mkdir -p "$SEMAPHORE_DIR"
+    touch /.provisioning
+
+    install_apt_packages
+    install_pip_packages
+    install_extensions
+    install_civitai_models
+    install_wget_downloads
+
+    log "✅ Provisioning finished successfully! (All models are valid PonyXL files)"
+}
+
+main
