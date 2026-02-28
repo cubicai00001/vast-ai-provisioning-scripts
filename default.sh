@@ -25,10 +25,10 @@ EXTENSIONS=(
 HF_MODELS_DEFAULT=()
 
 CIVITAI_MODELS_DEFAULT=(
-    # Pony Diffusion V6 XL - HF mirror FIRST (reliable), Civitai fallback
-    "https://huggingface.co/LyliaEngine/Pony_Diffusion_V6_XL/resolve/main/ponyDiffusionV6XL.safetensors https://civitai.com/api/download/models/290640?type=Model&format=SafeTensor&size=pruned&fp=fp16 | $MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors"
+    # Pony Diffusion V6 XL ─ Civitai first, HF mirror second
+    "https://civitai.com/api/download/models/290640?type=Model&format=SafeTensor&size=pruned&fp=fp16 https://huggingface.co/LyliaEngine/Pony_Diffusion_V6_XL/resolve/main/ponyDiffusionV6XL.safetensors | $MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors"
 
-    # Femboy (Otoko No Ko) v1.0
+    # Femboy (Otoko No Ko) v1.0 ─ only Civitai (no known good HF mirror)
     "https://civitai.com/api/download/models/222887?type=Model&format=SafeTensor | $MODELS_DIR/Lora/femboy_otoko_no_ko.safetensors"
 
     # Femboy v1.0
@@ -46,21 +46,20 @@ WGET_DOWNLOADS_DEFAULT=()
 ### End Configuration ###
 
 log() {
-    local message="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-    echo "$message"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
 script_cleanup() {
     log "Cleaning up semaphore directory..."
     rm -rf "$SEMAPHORE_DIR"
     find "$MODELS_DIR" -name "*.lock" -type f -mmin +60 -delete 2>/dev/null || true
-    rm -f /.provisioning  # Force-remove flag so Forge starts
+    rm -f /.provisioning
 }
 
 script_error() {
     local exit_code=$?
-    local line_number=$1
-    log "[ERROR] Provisioning script failed at line $line_number with exit code $exit_code"
+    local line=$1
+    log "[ERROR] Script failed at line $line (exit code $exit_code)"
     exit "$exit_code"
 }
 
@@ -68,215 +67,183 @@ trap script_cleanup EXIT
 trap 'script_error $LINENO' ERR
 
 normalize_entry() {
-    local entry="$1"
-    entry=$(echo "$entry" | tr '\n' ' ' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')
-    echo "$entry"
+    echo "$1" | tr -d '\n\r' | tr -s ' ' | sed 's/^ *//;s/ *$//'
 }
 
 parse_env_array() {
-    local env_var_name="$1"
-    local env_value="${!env_var_name:-}"
-
-    if [[ -n "$env_value" ]]; then
-        local -a result=()
-        IFS=';' read -ra entries <<< "$env_value"
-        for entry in "${entries[@]}"; do
-            entry=$(normalize_entry "$entry")
-            [[ -z "$entry" || "$entry" == \#* ]] && continue
-            result+=("$entry")
-        done
-        if [[ ${#result[@]} -gt 0 ]]; then
-            printf '%s\0' "${result[@]}"
-        fi
+    local var="$1"
+    local value="${!var:-}"
+    if [[ -z "$value" ]]; then return; fi
+    local -a arr=()
+    IFS=';' read -ra parts <<< "$value"
+    for p in "${parts[@]}"; do
+        p=$(normalize_entry "$p")
+        [[ -z "$p" || "$p" == \#* ]] && continue
+        arr+=("$p")
+    done
+    if [[ ${#arr[@]} -gt 0 ]]; then
+        printf '%s\0' "${arr[@]}"
     fi
 }
 
 merge_with_env() {
-    local env_var_name="$1"
+    local var="$1"
     shift
-    local -a default_array=("$@")
-    local env_value="${!env_var_name:-}"
+    local -a defaults=("$@")
+    local -a result=()
 
-    if [[ ${#default_array[@]} -gt 0 ]]; then
-        for entry in "${default_array[@]}"; do
-            entry=$(normalize_entry "$entry")
-            [[ -z "$entry" || "$entry" == \#* ]] && continue
-            printf '%s\0' "$entry"
-        done
-    fi
+    for d in "${defaults[@]}"; do
+        d=$(normalize_entry "$d")
+        [[ -z "$d" || "$d" == \#* ]] && continue
+        result+=("$d")
+    done
 
-    if [[ -n "$env_value" ]]; then
-        echo "[merge_with_env] Adding entries from $env_var_name environment variable" >&2
-        parse_env_array "$env_var_name"
-    fi
+    while IFS= read -r -d '' e; do
+        result+=("$e")
+    done < <(parse_env_array "$var")
+
+    printf '%s\0' "${result[@]}"
 }
 
 acquire_slot() {
-    local prefix="$1"
-    local max_slots="$2"
-    local slot_dir="$(dirname "$prefix")"
-    local slot_prefix="$(basename "$prefix")"
-
+    local prefix="$1" max="$2"
+    local dir="$(dirname "$prefix")" base="$(basename "$prefix")"
     while true; do
-        local count=$(find "$slot_dir" -maxdepth 1 -name "${slot_prefix}_*" 2>/dev/null | wc -l)
-        if [ "$count" -lt "$max_slots" ]; then
+        local cnt=$(find "$dir" -maxdepth 1 -name "${base}_*" 2>/dev/null | wc -l)
+        if (( cnt < max )); then
             local slot="${prefix}_$$_${RANDOM}_${RANDOM}"
             if (set -o noclobber; : > "$slot") 2>/dev/null; then
                 echo "$slot"
                 return 0
             fi
         fi
-        sleep 0.5
+        sleep 0.4
     done
 }
 
-release_slot() {
-    rm -f "$1"
-}
+release_slot() { rm -f "$1"; }
 
 download_file() {
-    local raw_urls="$1"
-    local output_path="$2"
-    local auth_type="${3:-}"
-    local max_retries=15
-    local retry_delay=10
+    local raw_urls="$1" dest="$2" auth_type="${3:-}"
+    local max_retries=15 base_delay=10
 
-    IFS=' ' read -ra urls <<< "$raw_urls"
+    IFS=' ' read -ra sources <<< "$raw_urls"
 
-    local slot
-    slot=$(acquire_slot "$SEMAPHORE_DIR/dl" "$MAX_PARALLEL")
+    local slot=$(acquire_slot "$SEMAPHORE_DIR/dl" "$MAX_PARALLEL")
     trap 'release_slot "$slot"' RETURN
 
-    local output_dir output_file use_content_disposition=false
-    if [[ "$output_path" == */ ]]; then
-        output_dir="${output_path%/}"
-        use_content_disposition=true
-    else
-        output_dir="$(dirname "$output_path")"
-        output_file="$(basename "$output_path")"
+    local out_dir="$(dirname "$dest")" out_file="$(basename "$dest")"
+    mkdir -p "$out_dir"
+
+    if [[ -f "$dest" && -s "$dest" ]]; then
+        log "Already exists and non-empty: $dest → skipping"
+        return 0
     fi
 
-    mkdir -p "$output_dir"
+    # ──────────────── Log test / debug info ────────────────
+    log "Starting download for $dest"
+    log "  Sources (${#sources[@]}): ${sources[*]}"
+    if [[ -n "${CIVITAI_TOKEN:-}" ]]; then
+        log "  CIVITAI_TOKEN is set (length ${#CIVITAI_TOKEN})"
+    else
+        log "  No CIVITAI_TOKEN detected"
+    fi
+    # ───────────────────────────────────────────────────────
 
     local auth_header=""
-    local token_param=""
+    local token_query=""
     if [[ -n "${CIVITAI_TOKEN:-}" ]]; then
-        log "CIVITAI_TOKEN detected (using for auth)"
         auth_header="Authorization: Bearer $CIVITAI_TOKEN"
-        token_param="?token=$CIVITAI_TOKEN"
+        token_query="?token=$CIVITAI_TOKEN"
     fi
 
-    local url_hash=$(printf '%s' "${urls[*]}" | md5sum | cut -d' ' -f1)
-    local lockfile="${output_dir}/.download_${url_hash}.lock"
+    local hash=$(printf '%s' "${sources[*]}" | md5sum | cut -d' ' -f1)
+    local lock="${out_dir}/.dl_${hash}.lock"
 
     (
         if ! flock -x -w 600 200; then
-            log "[ERROR] Lock timeout for $output_path"
+            log "[ERROR] Lock timeout for $dest"
             exit 1
         fi
 
-        if [[ -f "$output_dir/$output_file" && -s "$output_dir/$output_file" ]]; then
-            log "File exists and has size: $output_dir/$output_file (skipping)"
-            exit 0
-        fi
+        for url_base in "${sources[@]}"; do
+            local url="${url_base}${token_query}"
 
-        for base_url in "${urls[@]}"; do
-            local url="${base_url}${token_param}"
+            log "Trying source: $url"
 
-            local attempt=1
-            local current_delay=$retry_delay
+            local attempt=1 delay=$base_delay
 
-            while [ $attempt -le $max_retries ]; do
-                log "Attempt $attempt/$max_retries → $url"
+            while (( attempt <= max_retries )); do
+                log "  Attempt $attempt/$max_retries"
 
-                local wget_args=(
-                    --timeout=120
-                    --tries=1
-                    --continue
-                    --progress=dot:giga
-                    --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                    --no-check-certificate
-                )
+                if curl -L --fail --retry 1 --retry-delay 2 \
+                    --connect-timeout 60 --max-time 600 \
+                    ${auth_header:+-H "$auth_header"} \
+                    -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                    --no-progress-meter \
+                    -o "$dest.tmp" "$url"; then
 
-                if [[ -n "$auth_header" ]]; then
-                    wget_args+=(--header="$auth_header")
-                fi
-
-                local target_file="$output_dir/$output_file"
-                if [[ "$use_content_disposition" == true ]]; then
-                    wget_args+=(--content-disposition -P "$output_dir")
-                else
-                    target_file="$output_dir/$output_file.tmp"
-                    wget_args+=(-O "$target_file")
-                fi
-
-                if wget "${wget_args[@]}" "$url" 2>&1; then
-                    if [[ "$use_content_disposition" == false ]]; then
-                        mv "$target_file" "$output_dir/$output_file"
-                    fi
-                    log "Success: $output_dir/$output_file"
+                    mv "$dest.tmp" "$dest"
+                    log "SUCCESS → $dest"
                     exit 0
                 fi
 
-                log "Failed attempt $attempt, wait ${current_delay}s..."
-                sleep $current_delay
-                current_delay=$((current_delay * 2))
-                attempt=$((attempt + 1))
+                log "  Failed → waiting ${delay}s before retry..."
+                sleep "$delay"
+                ((delay = delay * 2))
+                if (( delay > 300 )); then delay=300; fi
+                ((attempt++))
             done
+
+            log "  All $max_retries attempts failed for this source"
         done
 
-        log "[ERROR] All sources failed for $output_path"
+        log "[FAIL] No source succeeded for $dest"
         exit 1
-    ) 200>"$lockfile"
+    ) 200>"$lock"
 
-    local result=$?
-    rm -f "$lockfile" "$output_dir/$output_file.tmp"
-    return $result
+    local rc=$?
+    rm -f "$lock" "$dest.tmp"
+    return $rc
 }
 
 install_apt_packages() {
-    if [[ ${#APT_PACKAGES[@]} -gt 0 ]]; then
-        log "Installing APT packages..."
-        sudo apt-get update
-        sudo apt-get install -y "${APT_PACKAGES[@]}"
-    fi
+    (( ${#APT_PACKAGES[@]} == 0 )) && return
+    log "Installing APT packages..."
+    sudo apt-get update -qq
+    sudo apt-get install -y --no-install-recommends "${APT_PACKAGES[@]}"
 }
 
 install_pip_packages() {
-    if [[ ${#PIP_PACKAGES[@]} -gt 0 ]]; then
-        log "Installing Python packages..."
-        uv pip install --no-cache-dir "${PIP_PACKAGES[@]}"
-    fi
+    (( ${#PIP_PACKAGES[@]} == 0 )) && return
+    log "Installing pip packages..."
+    uv pip install --no-cache-dir "${PIP_PACKAGES[@]}"
 }
 
 install_extensions() {
-    local -a extensions=()
-    while IFS= read -r -d '' entry; do
-        [[ -n "$entry" ]] && extensions+=("$entry")
-    done < <(merge_with_env "EXTENSIONS" "${EXTENSIONS[@]}")
+    local -a exts=()
+    while IFS= read -r -d '' e; do [[ -n "$e" ]] && exts+=("$e"); done < <(merge_with_env "EXTENSIONS" "${EXTENSIONS[@]}")
+    (( ${#exts[@]} == 0 )) && return
 
-    if [[ ${#extensions[@]} -eq 0 ]]; then return 0; fi
+    log "Installing/updating ${#exts[@]} extension(s)..."
 
-    log "Installing ${#extensions[@]} extension(s)..."
-
-    export GIT_CONFIG_GLOBAL=/tmp/gitconfig-safe
+    export GIT_CONFIG_GLOBAL=/tmp/git-safe
     echo "[safe]" > "$GIT_CONFIG_GLOBAL"
     echo "    directory = *" >> "$GIT_CONFIG_GLOBAL"
 
-    local ext_dir="${FORGE_DIR}/extensions"
-    mkdir -p "$ext_dir"
+    local d="${FORGE_DIR}/extensions"
+    mkdir -p "$d"
 
-    for repo_url in "${extensions[@]}"; do
+    for url in "${exts[@]}"; do
         (
-            local repo_name=$(basename "$repo_url" .git)
-            local target_dir="$ext_dir/$repo_name"
-
-            if [[ -d "$target_dir/.git" ]]; then
-                log "Updating: $repo_name"
-                (cd "$target_dir" && git pull --quiet) || log "[WARN] Update failed: $repo_name"
+            local name=$(basename "${url%.git}")
+            local tgt="$d/$name"
+            if [[ -d "$tgt/.git" ]]; then
+                log "  Updating $name"
+                (cd "$tgt" && git pull --quiet) || log "  [WARN] pull failed: $name"
             else
-                log "Cloning: $repo_name"
-                git clone --quiet --depth 1 "$repo_url" "$target_dir" || log "[WARN] Clone failed: $repo_name"
+                log "  Cloning $name"
+                git clone --quiet --depth 1 "$url" "$tgt" || log "  [WARN] clone failed: $name"
             fi
         ) &
     done
@@ -285,46 +252,33 @@ install_extensions() {
 
 install_civitai_models() {
     local -a models=()
-    while IFS= read -r -d '' entry; do
-        [[ -n "$entry" ]] && models+=("$entry")
-    done < <(merge_with_env "CIVITAI_MODELS" "${CIVITAI_MODELS_DEFAULT[@]}")
+    while IFS= read -r -d '' m; do [[ -n "$m" ]] && models+=("$m"); done < <(merge_with_env "CIVITAI_MODELS" "${CIVITAI_MODELS_DEFAULT[@]}")
+    (( ${#models[@]} == 0 )) && { log "No Civitai/HF models configured"; return; }
 
-    if [[ ${#models[@]} -eq 0 ]]; then
-        log "No Civitai models configured"
-        return 0
-    fi
-
-    log "Downloading ${#models[@]} Civitai model(s)..."
+    log "Downloading ${#models[@]} model file(s)..."
 
     for entry in "${models[@]}"; do
         (
-            IFS='|' read -r raw_urls output_path <<< "$entry"
-            raw_urls=$(echo "$raw_urls" | sed 's/[[:space:]]*$//;s/^ *//')
-            output_path=$(echo "$output_path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            if [[ -n "$raw_urls" && -n "$output_path" ]]; then
-                download_file "$raw_urls" "$output_path" "civitai"
-            fi
+            IFS='|' read -r urls dest <<< "$entry"
+            urls=$(normalize_entry "$urls")
+            dest=$(normalize_entry "$dest")
+            [[ -z "$urls" || -z "$dest" ]] && return
+            download_file "$urls" "$dest" "civitai"
         ) &
     done
     wait
 }
 
-install_wget_downloads() {
-    # similar to above - omitted for brevity, copy from previous if needed
-    log "No extra wget downloads configured"
-}
-
 main() {
     mkdir -p "$SEMAPHORE_DIR"
-    touch /.provisioning  # ensure flag exists at start
+    touch /.provisioning
 
     install_apt_packages
     install_pip_packages
     install_extensions
     install_civitai_models
-    install_wget_downloads
 
-    log "Provisioning finished!"
+    log "Provisioning finished."
 }
 
 main
