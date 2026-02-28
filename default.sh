@@ -7,18 +7,18 @@ FORGE_DIR="${WORKSPACE_DIR}/stable-diffusion-webui-forge"
 MODELS_DIR="${FORGE_DIR}/models"
 
 CIVITAI_MODELS_DEFAULT=(
-    # Pony Diffusion V6 XL - Civitai + CORRECT HF mirror (this filename actually exists)
-    "https://civitai.com/api/download/models/290640?type=Model&format=SafeTensor&size=pruned&fp=fp16 https://huggingface.co/LyliaEngine/Pony_Diffusion_V6_XL/resolve/main/ponyDiffusionV6XL_v6StartWithThisOne.safetensors | $MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors"
+    # Pony Diffusion V6 XL - 4 mirrors (Civitai + correct HF + Tensor.art)
+    "https://civitai.com/api/download/models/290640?type=Model&format=SafeTensor&size=pruned&fp=fp16 https://huggingface.co/6chan/Pony-Diffusion-V6-XL/resolve/main/ponyDiffusionV6XL_v6StartWithThisOne.safetensors https://huggingface.co/LyliaEngine/Pony_Diffusion_V6_XL/resolve/main/ponyDiffusionV6XL_v6StartWithThisOne.safetensors https://tensor.art/models/717274695390638697 | $MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors"
 
-    # Femboy LoRAs (your original list)
+    # Photorealistic alternatives (if Pony fails completely)
+    "https://civitai.com/api/download/models/139562?type=Model&format=SafeTensor&size=pruned&fp=fp16 https://huggingface.co/SG161222/RealVisXL_V5.0/resolve/main/RealVisXL_V5.0.safetensors | $MODELS_DIR/Stable-diffusion/realvisxl_v5.safetensors"
+    "https://civitai.com/api/download/models/133005?type=Model&format=SafeTensor&size=pruned&fp=fp16 | $MODELS_DIR/Stable-diffusion/juggernaut_xl_v9.safetensors"
+
+    # Your femboy LoRAs (unchanged)
     "https://civitai.com/api/download/models/222887?type=Model&format=SafeTensor | $MODELS_DIR/Lora/femboy_otoko_no_ko.safetensors"
     "https://civitai.com/api/download/models/173782?type=Model&format=SafeTensor&size=full&fp=fp16 | $MODELS_DIR/Lora/femboy.safetensors"
     "https://civitai.com/api/download/models/20797 | $MODELS_DIR/Lora/femboi_full_v1.safetensors"
     "https://civitai.com/api/download/models/324974 | $MODELS_DIR/Lora/femboysxl_v1.safetensors"
-
-    # Fallback alternatives (same style)
-    "https://civitai.com/api/download/models/2625213?type=Model&format=SafeTensor | $MODELS_DIR/Lora/male_mix_pony.safetensors"
-    "https://civitai.com/api/download/models/1861600?type=Model&format=SafeTensor | $MODELS_DIR/Lora/femboy_pony.safetensors"
     "https://huggingface.co/datasets/CollectorN01/PonyXL-Lora-MyAhhArchiveCN01/resolve/main/concept/CurvyFemboyXL.safetensors | $MODELS_DIR/Lora/curvy_femboy_xl.safetensors"
 )
 
@@ -56,8 +56,8 @@ download_file() {
 
         log "  Trying: $url"
 
-        if curl -L --fail --retry 3 --retry-delay 2 \
-            --connect-timeout 30 --max-time 600 \
+        if curl -L --fail --retry 4 --retry-delay 2 \
+            --connect-timeout 30 --max-time 900 \
             ${auth_header:+-H "$auth_header"} \
             -A "Mozilla/5.0" --no-progress-meter \
             -o "$dest.tmp" "$url"; then
