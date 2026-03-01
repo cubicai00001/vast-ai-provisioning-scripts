@@ -70,18 +70,24 @@ download_file() {
         return 0
     fi
 
+    # FIXED: Append token as query param for Civitai (reliable for redirects)
+    if [[ -n "${CIVITAI_TOKEN:-}" && "$url" == *civitai.com* ]]; then
+        if [[ "$url" == *'?'* ]]; then
+            url="${url}&token=${CIVITAI_TOKEN}"
+        else
+            url="${url}?token=${CIVITAI_TOKEN}"
+        fi
+        log "CIVITAI_TOKEN appended to URL"
+    fi
+
     while [ $retry -lt $max_retries ]; do
         log "Downloading ($((retry+1))/$max_retries): $output_file"
 
         local wget_cmd=(wget --timeout=90 --tries=1 --continue --progress=dot:giga \
             --user-agent="Mozilla/5.0" --no-check-certificate)
 
-        # FIXED AUTH LOGIC - this solves the 400 Bad Request
         if [[ -n "${HF_TOKEN:-}" && "$url" == *huggingface.co* ]]; then
             wget_cmd+=(--header="Authorization: Bearer $HF_TOKEN")
-        elif [[ -n "${CIVITAI_TOKEN:-}" && "$url" == *civitai.com* ]]; then
-            wget_cmd+=(--header="Authorization: Bearer $CIVITAI_TOKEN")
-            # NO ?token= append (prevents R2 400 errors)
         fi
 
         if "${wget_cmd[@]}" -O "$output_path.tmp" "$url"; then
