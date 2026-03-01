@@ -1,16 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
-### Configuration - Flux Photoreal NSFW (curl-based, full original features) ###
+### Configuration - Flux Photoreal NSFW (All Warnings/Errors Prevented Where Possible) ###
 WORKSPACE_DIR="${WORKSPACE:-/workspace}"
 FORGE_DIR="${WORKSPACE_DIR}/stable-diffusion-webui-forge"
 MODELS_DIR="${FORGE_DIR}/models"
 SEMAPHORE_DIR="${WORKSPACE_DIR}/download_sem_$$"
-MAX_PARALLEL="${MAX_PARALLEL:-2}"   # Safe for 30 GB disk
+MAX_PARALLEL="${MAX_PARALLEL:-2}"
 
 APT_PACKAGES=()
 PIP_PACKAGES=(
-    "bitsandbytes>=0.43.0"          # Required for NF4 Flux quantization
+    "bitsandbytes>=0.43.3"          # Required for NF4 Flux quantization
+    "mmcv==2.2.0"                   # For uddetailer/ADetailer
 )
 
 EXTENSIONS=(
@@ -22,7 +23,7 @@ EXTENSIONS=(
 )
 
 CIVITAI_MODELS_DEFAULT=(
-    # Main Flux model (NF4 quantized)
+    # Main Flux model
     "https://huggingface.co/lllyasviel/flux1-dev-bnb-nf4/resolve/main/flux1-dev-bnb-nf4-v2.safetensors | $MODELS_DIR/Stable-diffusion/flux1-dev-bnb-nf4-v2.safetensors"
 
     # Required Text Encoders
@@ -32,9 +33,13 @@ CIVITAI_MODELS_DEFAULT=(
     # Flux VAE
     "https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors | $MODELS_DIR/VAE/ae.safetensors"
 
-    # Recommended LoRAs (realism + femboy)
+    # Recommended LoRAs (with fallbacks for download issues)
     "https://huggingface.co/XLabs-AI/flux-RealismLora/resolve/main/lora.safetensors | $MODELS_DIR/Lora/realism_lora.safetensors"
-    "https://civitai.com/api/download/models/696714 | $MODELS_DIR/Lora/femboy_flux.safetensors"
+    "https://civitai.com/api/download/models/696714 https://civitai.com/api/download/models/655753 | $MODELS_DIR/Lora/femboy_flux.safetensors"  # Primary + NSFW Flux fallback
+
+    # IC-Light models to prevent "Failed to locate" error
+    "https://github.com/Haoming02/sd-forge-ic-light/releases/download/Models/iclight_sd15_fc.safetensors | $MODELS_DIR/Unet/iclight_sd15_fc.safetensors"
+    "https://github.com/Haoming02/sd-forge-ic-light/releases/download/Models/iclight_sd15_fbc.safetensors | $MODELS_DIR/Unet/iclight_sd15_fbc.safetensors"
 )
 
 WGET_DOWNLOADS_DEFAULT=()
@@ -109,7 +114,6 @@ acquire_slot() {
 
 release_slot() { rm -f "$1"; }
 
-# === ROBUST DOWNLOAD - Now using curl for better redirect & auth handling ===
 download_file() {
     local raw_urls="$1"
     local output_path="$2"
@@ -131,18 +135,23 @@ download_file() {
             rm -f "$output_path.tmp"
 
             local curl_args=(
-                -L                  # follow redirects
-                -f                  # fail on HTTP errors (e.g. 400/401/403)
-                --retry 5
+                -L 
+                -f 
+                --retry 3
                 --retry-delay 10
-                --connect-timeout 30
+                --connect-timeout 180
                 --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
                 -o "$output_path.tmp"
             )
 
-            # Add auth only for Hugging Face (Civitai uses its own token if needed)
+            # HF token for Hugging Face URLs
             if [[ "$url" == *huggingface.co* && -n "${HF_TOKEN:-}" ]]; then
                 curl_args+=(-H "Authorization: Bearer $HF_TOKEN")
+            fi
+
+            # Civitai token for Civitai URLs (if set via ENV)
+            if [[ "$url" == *civitai.com* && -n "${CIVITAI_TOKEN:-}" ]]; then
+                curl_args+=(-H "Authorization: Bearer $CIVITAI_TOKEN")
             fi
 
             if curl "${curl_args[@]}" "$url"; then
@@ -154,7 +163,7 @@ download_file() {
                     log "✓ SUCCESS: $(basename "$output_path") ($(numfmt --to=iec $actual_size))"
                     return 0
                 else
-                    log "✗ Temp file too small ($actual_size bytes < $min_size) - retrying"
+                    log "✗ Temp file too small - retrying"
                 fi
             else
                 log "✗ curl failed (exit code $?)"
@@ -172,9 +181,13 @@ download_file() {
 }
 
 install_apt_packages() { :; }
+
 install_pip_packages() {
     if [[ ${#PIP_PACKAGES[@]} -gt 0 ]]; then
         log "Installing PIP packages..."
+        # Fix for mmcv: Pin setuptools and use wheel link
+        pip install --no-cache-dir --upgrade "setuptools<82" wheel
+        pip install --no-cache-dir -f https://download.openmmlab.com/mmcv/dist/cu128/torch2.4/index.html mmcv==2.2.0
         pip install --no-cache-dir "${PIP_PACKAGES[@]}"
     fi
 }
@@ -230,12 +243,14 @@ main() {
     mkdir -p "$SEMAPHORE_DIR"
     touch /.provisioning
 
+    install_apt_packages
     install_pip_packages
     install_extensions
     install_civitai_models
     install_wget_downloads
 
-    log "✅ Provisioning finished successfully! (Flux setup with curl downloads)"
+    log "✅ Provisioning finished successfully! (Flux setup complete)"
+    log "To fix torch/xformers warnings, relaunch with: python launch.py --reinstall-torch --reinstall-xformers"
 }
 
 main
