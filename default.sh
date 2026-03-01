@@ -35,7 +35,7 @@ CIVITAI_MODELS_DEFAULT=(
 
     # Recommended LoRAs (with fallbacks for download issues)
     "https://huggingface.co/XLabs-AI/flux-RealismLora/resolve/main/lora.safetensors | $MODELS_DIR/Lora/realism_lora.safetensors"
-    "https://civitai.com/api/download/models/696714 https://civitai.com/api/download/models/655753 | $MODELS_DIR/Lora/femboy_flux.safetensors"  # Primary + NSFW Flux fallback
+    "https://civitai.com/api/download/models/696714 https://civitai.com/api/download/models/2184677 | $MODELS_DIR/Lora/femboy_flux.safetensors"  # Primary + "Plus1 flux men mix" fallback
 
     # IC-Light models to prevent "Failed to locate" error
     "https://github.com/Haoming02/sd-forge-ic-light/releases/download/Models/iclight_sd15_fc.safetensors | $MODELS_DIR/Unet/iclight_sd15_fc.safetensors"
@@ -114,6 +114,7 @@ acquire_slot() {
 
 release_slot() { rm -f "$1"; }
 
+# === ROBUST DOWNLOAD - Using curl for better redirect & auth handling ===
 download_file() {
     local raw_urls="$1"
     local output_path="$2"
