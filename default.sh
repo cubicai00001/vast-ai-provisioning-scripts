@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-### Configuration - Flux Photoreal NSFW (All Warnings/Errors Prevented Where Possible) ###
+### Configuration ###
 WORKSPACE_DIR="${WORKSPACE:-/workspace}"
 FORGE_DIR="${WORKSPACE_DIR}/stable-diffusion-webui-forge"
 MODELS_DIR="${FORGE_DIR}/models"
@@ -9,37 +9,36 @@ SEMAPHORE_DIR="${WORKSPACE_DIR}/download_sem_$$"
 MAX_PARALLEL="${MAX_PARALLEL:-2}"
 
 APT_PACKAGES=()
-PIP_PACKAGES=(
-    "bitsandbytes>=0.43.3"          # Required for NF4 Flux quantization
-    "mmcv==2.2.0"                   # For uddetailer/ADetailer
-)
+PIP_PACKAGES=()
 
 EXTENSIONS=(
-    "https://github.com/Mikubill/sd-webui-controlnet"
-    "https://github.com/Bing-su/adetailer"
-    "https://github.com/Haoming02/sd-forge-ic-light"
-    "https://github.com/Coyote-A/ultimate-upscale-for-automatic1111"
     "https://github.com/wkpark/uddetailer"
+    "https://github.com/Coyote-A/ultimate-upscale-for-automatic1111"
+    "https://github.com/Mikubill/sd-webui-controlnet"
+    "https://github.com/Ethereum-John/sd-webui-forge-faceswaplab"
+    "https://github.com/Haoming02/sd-forge-ic-light"
+    "https://github.com/zeittresor/sd-forge-fum"
+    "https://github.com/jessearodriguez/sd-forge-regional-prompter"
+    "https://github.com/Bing-su/adetailer"
 )
 
+HF_MODELS_DEFAULT=()
+
 CIVITAI_MODELS_DEFAULT=(
-    # Main Flux model
-    "https://huggingface.co/lllyasviel/flux1-dev-bnb-nf4/resolve/main/flux1-dev-bnb-nf4-v2.safetensors | $MODELS_DIR/Stable-diffusion/flux1-dev-bnb-nf4-v2.safetensors"
+    # Pony Diffusion V6 XL - HF mirror FIRST, Civitai fallback
+    "https://huggingface.co/LyliaEngine/Pony_Diffusion_V6_XL/resolve/main/ponyDiffusionV6XL.safetensors https://civitai.com/api/download/models/290640?type=Model&format=SafeTensor&size=pruned&fp=fp16 | $MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors"
 
-    # Required Text Encoders
-    "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors | $MODELS_DIR/text_encoder/clip_l.safetensors"
-    "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors | $MODELS_DIR/text_encoder/t5xxl_fp16.safetensors"
+    # Femboy (Otoko No Ko) v1.0
+    "https://civitai.com/api/download/models/222887?type=Model&format=SafeTensor | $MODELS_DIR/Lora/femboy_otoko_no_ko.safetensors"
 
-    # Flux VAE
-    "https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors | $MODELS_DIR/VAE/ae.safetensors"
+    # Femboy v1.0
+    "https://civitai.com/api/download/models/173782?type=Model&format=SafeTensor&size=full&fp=fp16 | $MODELS_DIR/Lora/femboy.safetensors"
 
-    # Recommended LoRAs (with fallbacks for download issues)
-    "https://huggingface.co/XLabs-AI/flux-RealismLora/resolve/main/lora.safetensors | $MODELS_DIR/Lora/realism_lora.safetensors"
-    "https://civitai.com/api/download/models/696714 https://civitai.com/api/download/models/2184677 | $MODELS_DIR/Lora/femboy_flux.safetensors"  # Primary + "Plus1 flux men mix" fallback
+    # Femboi Full v1.0
+    "https://civitai.com/api/download/models/20797 | $MODELS_DIR/Lora/femboi_full_v1.safetensors"
 
-    # IC-Light models to prevent "Failed to locate" error
-    "https://github.com/Haoming02/sd-forge-ic-light/releases/download/Models/iclight_sd15_fc.safetensors | $MODELS_DIR/Unet/iclight_sd15_fc.safetensors"
-    "https://github.com/Haoming02/sd-forge-ic-light/releases/download/Models/iclight_sd15_fbc.safetensors | $MODELS_DIR/Unet/iclight_sd15_fbc.safetensors"
+    # femboysXL v1.0
+    "https://civitai.com/api/download/models/324974 | $MODELS_DIR/Lora/femboysxl_v1.safetensors"
 )
 
 WGET_DOWNLOADS_DEFAULT=()
@@ -47,51 +46,67 @@ WGET_DOWNLOADS_DEFAULT=()
 ### End Configuration ###
 
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    local message="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "$message"
 }
 
 script_cleanup() {
-    log "Cleaning up..."
+    log "Cleaning up semaphore directory..."
     rm -rf "$SEMAPHORE_DIR"
+    find "$MODELS_DIR" -name "*.lock" -type f -mmin +60 -delete 2>/dev/null || true
     rm -f /.provisioning
 }
 
 script_error() {
-    log "[ERROR] Provisioning failed at line $1 with code $?"
-    exit 1
+    local exit_code=$?
+    local line_number=$1
+    log "[ERROR] Provisioning script failed at line $line_number with exit code $exit_code"
+    exit "$exit_code"
 }
 
 trap script_cleanup EXIT
 trap 'script_error $LINENO' ERR
 
 normalize_entry() {
-    echo "$1" | tr '\n' ' ' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//'
+    local entry="$1"
+    entry=$(echo "$entry" | tr '\n' ' ' | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')
+    echo "$entry"
 }
 
 parse_env_array() {
     local env_var_name="$1"
     local env_value="${!env_var_name:-}"
-    [[ -z "$env_value" ]] && return
-    local -a result=()
-    IFS=';' read -ra entries <<< "$env_value"
-    for entry in "${entries[@]}"; do
-        entry=$(normalize_entry "$entry")
-        [[ -z "$entry" || "$entry" == \#* ]] && continue
-        result+=("$entry")
-    done
-    printf '%s\0' "${result[@]}"
+    if [[ -n "$env_value" ]]; then
+        local -a result=()
+        IFS=';' read -ra entries <<< "$env_value"
+        for entry in "${entries[@]}"; do
+            entry=$(normalize_entry "$entry")
+            [[ -z "$entry" || "$entry" == \#* ]] && continue
+            result+=("$entry")
+        done
+        if [[ ${#result[@]} -gt 0 ]]; then
+            printf '%s\0' "${result[@]}"
+        fi
+    fi
 }
 
 merge_with_env() {
     local env_var_name="$1"
     shift
-    local -a defaults=("$@")
-    for entry in "${defaults[@]}"; do
-        entry=$(normalize_entry "$entry")
-        [[ -z "$entry" || "$entry" == \#* ]] && continue
-        printf '%s\0' "$entry"
-    done
-    parse_env_array "$env_var_name"
+    local -a default_array=("$@")
+    local env_value="${!env_var_name:-}"
+
+    if [[ ${#default_array[@]} -gt 0 ]]; then
+        for entry in "${default_array[@]}"; do
+            entry=$(normalize_entry "$entry")
+            [[ -z "$entry" || "$entry" == \#* ]] && continue
+            printf '%s\0' "$entry"
+        done
+    fi
+
+    if [[ -n "$env_value" ]]; then
+        parse_env_array "$env_var_name"
+    fi
 }
 
 acquire_slot() {
@@ -99,6 +114,7 @@ acquire_slot() {
     local max_slots="$2"
     local slot_dir="$(dirname "$prefix")"
     local slot_prefix="$(basename "$prefix")"
+
     while true; do
         local count=$(find "$slot_dir" -maxdepth 1 -name "${slot_prefix}_*" 2>/dev/null | wc -l)
         if [ "$count" -lt "$max_slots" ]; then
@@ -112,103 +128,159 @@ acquire_slot() {
     done
 }
 
-release_slot() { rm -f "$1"; }
+release_slot() {
+    rm -f "$1"
+}
 
-# === ROBUST DOWNLOAD - Using curl for better redirect & auth handling ===
 download_file() {
     local raw_urls="$1"
     local output_path="$2"
-    local min_size="${3:-10000000}"
+    local max_retries=15
+    local retry_delay=10
+
+    IFS=' ' read -ra urls <<< "$raw_urls"
 
     local slot
     slot=$(acquire_slot "$SEMAPHORE_DIR/dl" "$MAX_PARALLEL")
     trap 'release_slot "$slot"' RETURN
 
-    mkdir -p "$(dirname "$output_path")"
+    local output_dir output_file use_content_disposition=false
+    if [[ "$output_path" == */ ]]; then
+        output_dir="${output_path%/}"
+        use_content_disposition=true
+    else
+        output_dir="$(dirname "$output_path")"
+        output_file="$(basename "$output_path")"
+    fi
 
-    IFS=' ' read -ra urls <<< "$raw_urls"
+    mkdir -p "$output_dir"
 
-    for url in "${urls[@]}"; do
-        local attempt=1
-        while [ $attempt -le 5 ]; do
-            log "Downloading (attempt $attempt/5): $(basename "$output_path") from $url"
+    local url_hash=$(printf '%s' "${urls[*]}" | md5sum | cut -d' ' -f1)
+    local lockfile="${output_dir}/.download_${url_hash}.lock"
 
-            rm -f "$output_path.tmp"
+    (
+        if ! flock -x -w 600 200; then
+            log "[ERROR] Lock timeout for $output_path"
+            exit 1
+        fi
 
-            local curl_args=(
-                -L 
-                -f 
-                --retry 3
-                --retry-delay 10
-                --connect-timeout 180
-                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
-                -o "$output_path.tmp"
-            )
+        if [[ -f "$output_dir/$output_file" && -s "$output_dir/$output_file" ]]; then
+            log "File exists and has size: $output_dir/$output_file (skipping)"
+            exit 0
+        fi
 
-            # HF token for Hugging Face URLs
-            if [[ "$url" == *huggingface.co* && -n "${HF_TOKEN:-}" ]]; then
-                curl_args+=(-H "Authorization: Bearer $HF_TOKEN")
-            fi
+        for base_url in "${urls[@]}"; do
+            local url="$base_url"
 
-            # Civitai token for Civitai URLs (if set via ENV)
-            if [[ "$url" == *civitai.com* && -n "${CIVITAI_TOKEN:-}" ]]; then
-                curl_args+=(-H "Authorization: Bearer $CIVITAI_TOKEN")
-            fi
-
-            if curl "${curl_args[@]}" "$url"; then
-                local actual_size=$(stat -c %s "$output_path.tmp" 2>/dev/null || echo 0)
-                log "Downloaded temp file size: $(numfmt --to=iec $actual_size)"
-
-                if [ "$actual_size" -gt 0 ] && [ "$actual_size" -ge "$min_size" ]; then
-                    mv "$output_path.tmp" "$output_path"
-                    log "✓ SUCCESS: $(basename "$output_path") ($(numfmt --to=iec $actual_size))"
-                    return 0
+            # === FIXED AUTH HANDLING ===
+            if [[ -n "${HF_TOKEN:-}" && "$base_url" == *huggingface.co* ]]; then
+                wget_args_extra=(--header="Authorization: Bearer $HF_TOKEN")
+                log "HF_TOKEN applied to $base_url"
+            elif [[ -n "${CIVITAI_TOKEN:-}" && "$base_url" == *civitai.com* ]]; then
+                if [[ "$base_url" == *'?'* ]]; then
+                    url="${base_url}&token=${CIVITAI_TOKEN}"
                 else
-                    log "✗ Temp file too small - retrying"
+                    url="${base_url}?token=${CIVITAI_TOKEN}"
                 fi
+                wget_args_extra=(--header="Authorization: Bearer $CIVITAI_TOKEN")
+                log "CIVITAI_TOKEN applied to $base_url"
             else
-                log "✗ curl failed (exit code $?)"
+                wget_args_extra=()
             fi
+            # ============================
 
-            rm -f "$output_path.tmp"
-            log "Retrying in 10s..."
-            sleep 10
-            attempt=$((attempt + 1))
+            local attempt=1
+            local current_delay=$retry_delay
+
+            while [ $attempt -le $max_retries ]; do
+                log "Attempt $attempt/$max_retries → $url"
+
+                local wget_args=(
+                    --timeout=120
+                    --tries=1
+                    --continue
+                    --progress=dot:giga
+                    --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    --no-check-certificate
+                    "${wget_args_extra[@]}"
+                )
+
+                local target_file="$output_dir/$output_file"
+                if [[ "$use_content_disposition" == true ]]; then
+                    wget_args+=(--content-disposition -P "$output_dir")
+                else
+                    target_file="$output_dir/$output_file.tmp"
+                    wget_args+=(-O "$target_file")
+                fi
+
+                if wget "${wget_args[@]}" "$url" 2>&1; then
+                    if [[ "$use_content_disposition" == false ]]; then
+                        mv "$target_file" "$output_dir/$output_file" 2>/dev/null || true
+                    fi
+                    log "Success: $output_dir/$output_file"
+                    exit 0
+                fi
+
+                log "Failed attempt $attempt, wait ${current_delay}s..."
+                sleep $current_delay
+                current_delay=$((current_delay * 2))
+                attempt=$((attempt + 1))
+            done
         done
-    done
 
-    log "✗ FAILED after retries: $(basename "$output_path")"
-    return 1
+        log "[ERROR] All sources failed for $output_path"
+        exit 1
+    ) 200>"$lockfile"
+
+    local result=$?
+    rm -f "$lockfile" "$output_dir/$output_file.tmp" 2>/dev/null
+    return $result
 }
 
-install_apt_packages() { :; }
+install_apt_packages() {
+    if [[ ${#APT_PACKAGES[@]} -gt 0 ]]; then
+        log "Installing APT packages..."
+        sudo apt-get update
+        sudo apt-get install -y "${APT_PACKAGES[@]}"
+    fi
+}
 
 install_pip_packages() {
     if [[ ${#PIP_PACKAGES[@]} -gt 0 ]]; then
-        log "Installing PIP packages..."
-        # Fix for mmcv: Pin setuptools and use wheel link
-        pip install --no-cache-dir --upgrade "setuptools<82" wheel
-        pip install --no-cache-dir -f https://download.openmmlab.com/mmcv/dist/cu128/torch2.4/index.html mmcv==2.2.0
+        log "Installing Python packages..."
+        uv pip install --no-cache-dir "${PIP_PACKAGES[@]}" 2>/dev/null || \
         pip install --no-cache-dir "${PIP_PACKAGES[@]}"
     fi
 }
 
 install_extensions() {
-    local -a exts=()
-    while IFS= read -r -d '' e; do [[ -n "$e" ]] && exts+=("$e"); done < <(merge_with_env "EXTENSIONS" "${EXTENSIONS[@]}")
-    [[ ${#exts[@]} -eq 0 ]] && return
+    local -a extensions=()
+    while IFS= read -r -d '' entry; do
+        [[ -n "$entry" ]] && extensions+=("$entry")
+    done < <(merge_with_env "EXTENSIONS" "${EXTENSIONS[@]}")
 
-    log "Installing ${#exts[@]} extensions..."
+    if [[ ${#extensions[@]} -eq 0 ]]; then return 0; fi
+
+    log "Installing ${#extensions[@]} extension(s)..."
+
+    export GIT_CONFIG_GLOBAL=/tmp/gitconfig-safe
+    echo "[safe]" > "$GIT_CONFIG_GLOBAL"
+    echo "    directory = *" >> "$GIT_CONFIG_GLOBAL"
+
     local ext_dir="${FORGE_DIR}/extensions"
     mkdir -p "$ext_dir"
-    for url in "${exts[@]}"; do
+
+    for repo_url in "${extensions[@]}"; do
         (
-            local name=$(basename "$url" .git)
-            local target="$ext_dir/$name"
-            if [[ -d "$target/.git" ]]; then
-                (cd "$target" && git pull --quiet) || log "[WARN] Update failed: $name"
+            local repo_name=$(basename "$repo_url" .git)
+            local target_dir="$ext_dir/$repo_name"
+
+            if [[ -d "$target_dir/.git" ]]; then
+                log "Updating: $repo_name"
+                (cd "$target_dir" && git pull --quiet) || log "[WARN] Update failed: $repo_name"
             else
-                git clone --quiet --depth 1 "$url" "$target" || log "[WARN] Clone failed: $name"
+                log "Cloning: $repo_name"
+                git clone --quiet --depth 1 "$repo_url" "$target_dir" || log "[WARN] Clone failed: $repo_name"
             fi
         ) &
     done
@@ -217,28 +289,57 @@ install_extensions() {
 
 install_civitai_models() {
     local -a models=()
-    while IFS= read -r -d '' m; do [[ -n "$m" ]] && models+=("$m"); done < <(merge_with_env "CIVITAI_MODELS" "${CIVITAI_MODELS_DEFAULT[@]}")
-    [[ ${#models[@]} -eq 0 ]] && { log "No models configured"; return 0; }
+    while IFS= read -r -d '' entry; do
+        [[ -n "$entry" ]] && models+=("$entry")
+    done < <(merge_with_env "CIVITAI_MODELS" "${CIVITAI_MODELS_DEFAULT[@]}")
 
-    log "Downloading ${#models[@]} Flux model(s)/encoder(s)/LoRA(s)..."
+    if [[ ${#models[@]} -eq 0 ]]; then
+        log "No Civitai models configured"
+        return 0
+    fi
+
+    log "Downloading ${#models[@]} Civitai model(s)..."
+
     for entry in "${models[@]}"; do
         (
-            IFS='|' read -r urls path <<< "$entry"
-            urls=$(normalize_entry "$urls")
-            path=$(normalize_entry "$path")
-            [[ -z "$urls" || -z "$path" ]] && return
-
-            local min_size=10000000
-            if [[ "$path" == *flux1-dev-bnb-nf4* ]]; then min_size=11000000000; fi
-            if [[ "$path" == *t5xxl_fp16* ]]; then min_size=9000000000; fi
-
-            download_file "$urls" "$path" "$min_size"
+            IFS='|' read -r raw_urls output_path <<< "$entry"
+            raw_urls=$(echo "$raw_urls" | sed 's/[[:space:]]*$//;s/^ *//')
+            output_path=$(echo "$output_path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [[ -n "$raw_urls" && -n "$output_path" ]]; then
+                download_file "$raw_urls" "$output_path"
+            fi
         ) &
     done
     wait
 }
 
-install_wget_downloads() { log "No extra wget downloads configured"; }
+install_wget_downloads() {
+    local -a downloads=()
+    while IFS= read -r -d '' entry; do
+        [[ -n "$entry" ]] && downloads+=("$entry")
+    done < <(merge_with_env "WGET_DOWNLOADS" "${WGET_DOWNLOADS_DEFAULT[@]}")
+
+    if [[ ${#downloads[@]} -eq 0 ]]; then
+        log "No extra wget downloads configured"
+        return 0
+    fi
+
+    log "Downloading ${#downloads[@]} extra wget file(s)..."
+
+    for entry in "${downloads[@]}"; do
+        (
+            IFS='|' read -r raw_urls output_path <<< "$entry"
+            raw_urls=$(echo "$raw_urls" | sed 's/[[:space:]]*$//;s/^ *//')
+            output_path=$(echo "$output_path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [[ -n "$raw_urls" && -n "$output_path" ]]; then
+                download_file "$raw_urls" "$output_path"
+            else
+                log "[WARN] Invalid WGET_DOWNLOADS entry: $entry"
+            fi
+        ) &
+    done
+    wait
+}
 
 main() {
     mkdir -p "$SEMAPHORE_DIR"
@@ -250,8 +351,7 @@ main() {
     install_civitai_models
     install_wget_downloads
 
-    log "✅ Provisioning finished successfully! (Flux setup complete)"
-    log "To fix torch/xformers warnings, relaunch with: python launch.py --reinstall-torch --reinstall-xformers"
+    log "Provisioning finished!"
 }
 
 main
