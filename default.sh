@@ -1,16 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-### Configuration - Flux Photoreal NSFW (Full Features + bitsandbytes Fix) ###
+### Configuration - Flux Photoreal NSFW (curl-based, full original features) ###
 WORKSPACE_DIR="${WORKSPACE:-/workspace}"
 FORGE_DIR="${WORKSPACE_DIR}/stable-diffusion-webui-forge"
 MODELS_DIR="${FORGE_DIR}/models"
 SEMAPHORE_DIR="${WORKSPACE_DIR}/download_sem_$$"
-MAX_PARALLEL="${MAX_PARALLEL:-2}"
+MAX_PARALLEL="${MAX_PARALLEL:-2}"   # Safe for 30 GB disk
 
 APT_PACKAGES=()
 PIP_PACKAGES=(
-    "bitsandbytes>=0.43.0"          # ← This fixes the AssertionError for NF4 Flux
+    "bitsandbytes>=0.43.0"          # Required for NF4 Flux quantization
 )
 
 EXTENSIONS=(
@@ -22,7 +22,7 @@ EXTENSIONS=(
 )
 
 CIVITAI_MODELS_DEFAULT=(
-    # Main Flux model
+    # Main Flux model (NF4 quantized)
     "https://huggingface.co/lllyasviel/flux1-dev-bnb-nf4/resolve/main/flux1-dev-bnb-nf4-v2.safetensors | $MODELS_DIR/Stable-diffusion/flux1-dev-bnb-nf4-v2.safetensors"
 
     # Required Text Encoders
@@ -32,14 +32,18 @@ CIVITAI_MODELS_DEFAULT=(
     # Flux VAE
     "https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors | $MODELS_DIR/VAE/ae.safetensors"
 
-    # Recommended LoRAs
+    # Recommended LoRAs (realism + femboy)
     "https://huggingface.co/XLabs-AI/flux-RealismLora/resolve/main/lora.safetensors | $MODELS_DIR/Lora/realism_lora.safetensors"
     "https://civitai.com/api/download/models/696714 | $MODELS_DIR/Lora/femboy_flux.safetensors"
 )
 
+WGET_DOWNLOADS_DEFAULT=()
+
 ### End Configuration ###
 
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
 
 script_cleanup() {
     log "Cleaning up..."
@@ -105,6 +109,7 @@ acquire_slot() {
 
 release_slot() { rm -f "$1"; }
 
+# === ROBUST DOWNLOAD - Now using curl for better redirect & auth handling ===
 download_file() {
     local raw_urls="$1"
     local output_path="$2"
@@ -121,17 +126,26 @@ download_file() {
     for url in "${urls[@]}"; do
         local attempt=1
         while [ $attempt -le 5 ]; do
-            log "Downloading (attempt $attempt/5): $(basename "$output_path")"
+            log "Downloading (attempt $attempt/5): $(basename "$output_path") from $url"
 
             rm -f "$output_path.tmp"
 
-            local wget_args=(--progress=bar:force:noscroll --continue --tries=3 --timeout=180 --no-check-certificate)
+            local curl_args=(
+                -L                  # follow redirects
+                -f                  # fail on HTTP errors (e.g. 400/401/403)
+                --retry 5
+                --retry-delay 10
+                --connect-timeout 30
+                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+                -o "$output_path.tmp"
+            )
 
+            # Add auth only for Hugging Face (Civitai uses its own token if needed)
             if [[ "$url" == *huggingface.co* && -n "${HF_TOKEN:-}" ]]; then
-                wget_args+=(--header="Authorization: Bearer $HF_TOKEN")
+                curl_args+=(-H "Authorization: Bearer $HF_TOKEN")
             fi
 
-            if wget "${wget_args[@]}" "$url" -O "$output_path.tmp"; then
+            if curl "${curl_args[@]}" "$url"; then
                 local actual_size=$(stat -c %s "$output_path.tmp" 2>/dev/null || echo 0)
                 log "Downloaded temp file size: $(numfmt --to=iec $actual_size)"
 
@@ -139,10 +153,15 @@ download_file() {
                     mv "$output_path.tmp" "$output_path"
                     log "✓ SUCCESS: $(basename "$output_path") ($(numfmt --to=iec $actual_size))"
                     return 0
+                else
+                    log "✗ Temp file too small ($actual_size bytes < $min_size) - retrying"
                 fi
+            else
+                log "✗ curl failed (exit code $?)"
             fi
 
             rm -f "$output_path.tmp"
+            log "Retrying in 10s..."
             sleep 10
             attempt=$((attempt + 1))
         done
@@ -150,6 +169,14 @@ download_file() {
 
     log "✗ FAILED after retries: $(basename "$output_path")"
     return 1
+}
+
+install_apt_packages() { :; }
+install_pip_packages() {
+    if [[ ${#PIP_PACKAGES[@]} -gt 0 ]]; then
+        log "Installing PIP packages..."
+        pip install --no-cache-dir "${PIP_PACKAGES[@]}"
+    fi
 }
 
 install_extensions() {
@@ -197,14 +224,18 @@ install_civitai_models() {
     wait
 }
 
+install_wget_downloads() { log "No extra wget downloads configured"; }
+
 main() {
     mkdir -p "$SEMAPHORE_DIR"
     touch /.provisioning
 
+    install_pip_packages
     install_extensions
     install_civitai_models
+    install_wget_downloads
 
-    log "✅ Provisioning finished successfully! (Flux + bitsandbytes ready)"
+    log "✅ Provisioning finished successfully! (Flux setup with curl downloads)"
 }
 
 main
