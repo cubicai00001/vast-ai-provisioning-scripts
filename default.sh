@@ -1,7 +1,8 @@
+```bash
 #!/bin/bash
 set -euo pipefail
 
-### Configuration - PonyXL Optimized (Full Original Features + Robust Fixes) ###
+### Configuration - Flux Optimized (Photorealistic NSFW Focus + Fallbacks) ###
 WORKSPACE_DIR="${WORKSPACE:-/workspace}"
 FORGE_DIR="${WORKSPACE_DIR}/stable-diffusion-webui-forge"
 MODELS_DIR="${FORGE_DIR}/models"
@@ -22,15 +23,15 @@ EXTENSIONS=(
     "https://github.com/Bing-su/adetailer"
 )
 
-# ONLY PonyXL-compatible models (no SD 1.5 LoRAs → zero shape errors)
+# Flux models and compatible LoRAs (with fallbacks for base)
 CIVITAI_MODELS_DEFAULT=(
-    # Base - Pony Diffusion V6 XL (HF primary + Civitai fallback) - needs large min_size
-    "https://huggingface.co/LyliaEngine/Pony_Diffusion_V6_XL/resolve/main/ponyDiffusionV6XL.safetensors https://civitai.com/api/download/models/290640?type=Model&format=SafeTensor&size=pruned&fp=fp16 | $MODELS_DIR/Stable-diffusion/ponyDiffusionV6XL.safetensors"
+    # Primary: Flux.1 Dev NF4 quantized (12 GB) + Fallback: Flux.1 Schnell (23.8 GB)
+    "https://huggingface.co/lllyasviel/flux1-dev-bnb-nf4/resolve/main/flux1-dev-bnb-nf4-v2.safetensors https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors | $MODELS_DIR/Stable-diffusion/flux1-dev-bnb-nf4-v2.safetensors"
 
-    # PonyXL Femboy LoRAs (all confirmed compatible) - small files
-    "https://civitai.com/api/download/models/324974 | $MODELS_DIR/Lora/femboysxl_v1.safetensors"
-    "https://civitai.com/api/download/models/2625213?type=Model&format=SafeTensor | $MODELS_DIR/Lora/male_mix_pony.safetensors"
-    "https://huggingface.co/datasets/CollectorN01/PonyXL-Lora-MyAhhArchiveCN01/resolve/main/concept/CurvyFemboyXL.safetensors | $MODELS_DIR/Lora/curvy_femboy_xl.safetensors"
+    # Flux-compatible LoRAs (realism booster + femboy + shemale)
+    "https://huggingface.co/XLabs-AI/flux-RealismLora/resolve/main/lora.safetensors | $MODELS_DIR/Lora/realism_lora.safetensors"
+    "https://civitai.com/api/download/models/696714 | $MODELS_DIR/Lora/femboy_flux.safetensors"
+    "https://civitai.com/api/download/models/151669 | $MODELS_DIR/Lora/shemale_flux.safetensors"
 )
 
 WGET_DOWNLOADS_DEFAULT=()
@@ -109,7 +110,7 @@ release_slot() { rm -f "$1"; }
 download_file() {
     local raw_urls="$1"
     local output_path="$2"
-    local min_size="${3:-50000000}"   # Default 50 MB - safe for LoRAs; override for base model
+    local min_size="${3:-10000000}"   # Default 10 MB - safe for LoRAs; override for base models
 
     local slot
     slot=$(acquire_slot "$SEMAPHORE_DIR/dl" "$MAX_PARALLEL")
@@ -189,7 +190,7 @@ install_civitai_models() {
     while IFS= read -r -d '' m; do [[ -n "$m" ]] && models+=("$m"); done < <(merge_with_env "CIVITAI_MODELS" "${CIVITAI_MODELS_DEFAULT[@]}")
     [[ ${#models[@]} -eq 0 ]] && { log "No models configured"; return 0; }
 
-    log "Downloading ${#models[@]} PonyXL model(s)/LoRA(s)..."
+    log "Downloading ${#models[@]} Flux model(s)/LoRA(s)..."
     for entry in "${models[@]}"; do
         (
             IFS='|' read -r urls path <<< "$entry"
@@ -197,11 +198,13 @@ install_civitai_models() {
             path=$(normalize_entry "$path")
             [[ -z "$urls" || -z "$path" ]] && return
 
-            local min_size=50000000  # default for LoRAs
+            local min_size=10000000  # default for LoRAs (~10 MB min)
 
-            # Special case: base model needs large min_size
-            if [[ "$path" == *ponyDiffusionV6XL.safetensors ]]; then
-                min_size=6500000000
+            # Special cases for base models (large sizes)
+            if [[ "$path" == *flux1-dev-bnb-nf4-v2.safetensors ]]; then
+                min_size=11000000000  # ~11 GB min for NF4 (actual ~12 GB)
+            elif [[ "$path" == *flux1-schnell.safetensors ]]; then
+                min_size=20000000000  # ~20 GB min for Schnell (actual ~23.8 GB)
             fi
 
             download_file "$urls" "$path" "$min_size"
@@ -222,7 +225,8 @@ main() {
     install_civitai_models
     install_wget_downloads
 
-    log "✅ Provisioning finished successfully! (All models are valid PonyXL files)"
+    log "✅ Provisioning finished successfully! (All models are valid Flux files with fallbacks)"
 }
 
 main
+```
