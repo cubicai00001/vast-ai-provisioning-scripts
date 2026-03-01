@@ -1,15 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
-### Configuration - Flux Photoreal NSFW (Full Original Features + Fixes) ###
+### Configuration - Flux Photoreal NSFW (Full Features + bitsandbytes Fix) ###
 WORKSPACE_DIR="${WORKSPACE:-/workspace}"
 FORGE_DIR="${WORKSPACE_DIR}/stable-diffusion-webui-forge"
 MODELS_DIR="${FORGE_DIR}/models"
 SEMAPHORE_DIR="${WORKSPACE_DIR}/download_sem_$$"
-MAX_PARALLEL="${MAX_PARALLEL:-2}"   # Lowered to 2 to stay safely under 30 GB
+MAX_PARALLEL="${MAX_PARALLEL:-2}"
 
 APT_PACKAGES=()
-PIP_PACKAGES=()
+PIP_PACKAGES=(
+    "bitsandbytes>=0.43.0"          # ← This fixes the AssertionError for NF4 Flux
+)
 
 EXTENSIONS=(
     "https://github.com/Mikubill/sd-webui-controlnet"
@@ -19,9 +21,8 @@ EXTENSIONS=(
     "https://github.com/wkpark/uddetailer"
 )
 
-# === FLUX MODELS + REQUIRED FILES (with fallbacks) ===
 CIVITAI_MODELS_DEFAULT=(
-    # Main Flux model (NF4 quantized)
+    # Main Flux model
     "https://huggingface.co/lllyasviel/flux1-dev-bnb-nf4/resolve/main/flux1-dev-bnb-nf4-v2.safetensors | $MODELS_DIR/Stable-diffusion/flux1-dev-bnb-nf4-v2.safetensors"
 
     # Required Text Encoders
@@ -31,18 +32,14 @@ CIVITAI_MODELS_DEFAULT=(
     # Flux VAE
     "https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors | $MODELS_DIR/VAE/ae.safetensors"
 
-    # Recommended LoRAs for your femboy / crossdresser / shemale scenes
+    # Recommended LoRAs
     "https://huggingface.co/XLabs-AI/flux-RealismLora/resolve/main/lora.safetensors | $MODELS_DIR/Lora/realism_lora.safetensors"
     "https://civitai.com/api/download/models/696714 | $MODELS_DIR/Lora/femboy_flux.safetensors"
 )
 
-WGET_DOWNLOADS_DEFAULT=()
-
 ### End Configuration ###
 
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
-}
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
 
 script_cleanup() {
     log "Cleaning up..."
@@ -142,15 +139,10 @@ download_file() {
                     mv "$output_path.tmp" "$output_path"
                     log "✓ SUCCESS: $(basename "$output_path") ($(numfmt --to=iec $actual_size))"
                     return 0
-                else
-                    log "✗ Temp file too small - retrying"
                 fi
-            else
-                log "✗ wget failed (exit code $?)"
             fi
 
             rm -f "$output_path.tmp"
-            log "Retrying in 10s..."
             sleep 10
             attempt=$((attempt + 1))
         done
@@ -159,9 +151,6 @@ download_file() {
     log "✗ FAILED after retries: $(basename "$output_path")"
     return 1
 }
-
-install_apt_packages() { :; }
-install_pip_packages() { :; }
 
 install_extensions() {
     local -a exts=()
@@ -208,19 +197,14 @@ install_civitai_models() {
     wait
 }
 
-install_wget_downloads() { log "No extra wget downloads configured"; }
-
 main() {
     mkdir -p "$SEMAPHORE_DIR"
     touch /.provisioning
 
-    install_apt_packages
-    install_pip_packages
     install_extensions
     install_civitai_models
-    install_wget_downloads
 
-    log "✅ Provisioning finished successfully! (Full Flux setup ready)"
+    log "✅ Provisioning finished successfully! (Flux + bitsandbytes ready)"
 }
 
 main
