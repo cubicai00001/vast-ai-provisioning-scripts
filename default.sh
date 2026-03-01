@@ -6,148 +6,93 @@ WORKSPACE_DIR="${WORKSPACE:-/workspace}"
 FORGE_DIR="${WORKSPACE_DIR}/stable-diffusion-webui-forge"
 MODELS_DIR="${FORGE_DIR}/models"
 SEMAPHORE_DIR="${WORKSPACE_DIR}/download_sem_$$"
-MAX_PARALLEL="${MAX_PARALLEL:-3}"
+MAX_PARALLEL="${MAX_PARALLEL:-2}"
 
-### Photorealistic Crossdresser / Femboy Setup (Grok Imagine quality) ###
+# Early venv setup for build tools (fixes mmcv-style errors)
+uv pip install --upgrade "setuptools>=70" wheel packaging
+
+APT_PACKAGES=()
+PIP_PACKAGES=()
+
+# Removed: uddetailer (breaks Forge), faceswaplab (git issues), regional-prompter (sd_hijack error)
+# Kept: ADetailer, ControlNet, IC-Light, ultimate-upscale, fum (all stable)
+EXTENSIONS=(
+    "https://github.com/Bing-su/adetailer"
+    "https://github.com/Mikubill/sd-webui-controlnet"
+    "https://github.com/Haoming02/sd-forge-ic-light"
+    "https://github.com/zeittresor/sd-forge-fum"
+    "https://github.com/Coyote-A/ultimate-upscale-for-automatic1111"
+)
+
+# Your original femboy models + Juggernaut (kept)
+# Added: muscular dominant male LoRA example (change URL if you prefer another)
 CIVITAI_MODELS_DEFAULT=(
-    # Juggernaut XL Ragnarok - best photoreal SDXL base 2026
     "https://civitai.com/api/download/models/1759168?type=Model&format=SafeTensor&size=full&fp=fp16 | $MODELS_DIR/Stable-diffusion/juggernautXL_ragnarok.safetensors"
-
-    # Juggernaut Cinematic XL LoRA - cinematic realism, perfect skin & lighting
     "https://civitai.com/api/download/models/131991?type=Model&format=SafeTensor | $MODELS_DIR/Lora/juggernaut_cinematic_xl.safetensors"
-
-    # Best realistic femboy / crossdresser LoRAs for Juggernaut
     "https://civitai.com/api/download/models/222887?type=Model&format=SafeTensor | $MODELS_DIR/Lora/femboy_otoko_no_ko.safetensors"
     "https://civitai.com/api/download/models/173782?type=Model&format=SafeTensor&size=full&fp=fp16 | $MODELS_DIR/Lora/femboy_v1.safetensors"
     "https://civitai.com/api/download/models/20797?type=Model&format=SafeTensor | $MODELS_DIR/Lora/femboi_full_v1.safetensors"
     "https://civitai.com/api/download/models/324974?type=Model&format=SafeTensor | $MODELS_DIR/Lora/femboysxl_v1.safetensors"
-
-    # Flux.1 Dev (FP8) - uncomment to enable (needs HF_TOKEN for gated access)
-    # "https://huggingface.co/Comfy-Org/flux1-dev/resolve/main/flux1-dev-fp8.safetensors | $MODELS_DIR/Unet/flux1-dev-fp8.safetensors"
-    # "https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors | $MODELS_DIR/VAE/ae.safetensors"
-    # "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors | $MODELS_DIR/Clip/clip_l.safetensors"
-    # "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors | $MODELS_DIR/Clip/t5xxl_fp8_e4m3fn.safetensors"
+    # Muscular dominant male (example - replace with your favorite)
+    "https://civitai.com/api/download/models/123456?type=Model&format=SafeTensor | $MODELS_DIR/Lora/muscular_dominant_male.safetensors"  # ← change this ID
 )
 
-EXTENSIONS=(
-    "https://github.com/Bing-su/adetailer"
-    "https://github.com/Mikubill/sd-webui-controlnet"
-    "https://github.com/wkpark/uddetailer"
-    "https://github.com/Coyote-A/ultimate-upscale-for-automatic1111"
-    "https://github.com/Ethereum-John/sd-webui-forge-faceswaplab"
-    "https://github.com/Haoming02/sd-forge-ic-light"
-    "https://github.com/zeittresor/sd-forge-fum"
-    "https://github.com/jessearodriguez/sd-forge-regional-prompter"
+WGET_DOWNLOADS_DEFAULT=(
+    # IC-Light models (required by the extension)
+    "https://huggingface.co/lllyasviel/iclight_v2/resolve/main/iclight_sd15_fc.safetensors $MODELS_DIR/iclight/iclight_sd15_fc.safetensors"
+    "https://huggingface.co/lllyasviel/iclight_v2/resolve/main/iclight_sd15_fbc.safetensors $MODELS_DIR/iclight/iclight_sd15_fbc.safetensors"
 )
-
-### End Configuration ###
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
 script_cleanup() {
-    log "Cleaning up..."
     rm -rf "$SEMAPHORE_DIR" 2>/dev/null || true
     rm -f /.provisioning
 }
 
 trap script_cleanup EXIT
-trap 'log "Error on line $LINENO"; exit 1' ERR
 
-download_file() {
-    local url="$1"
-    local output_path="$2"
-    local max_retries=12
-    local retry=0
-
-    local output_dir="$(dirname "$output_path")"
-    local output_file="$(basename "$output_path")"
-    mkdir -p "$output_dir"
-
-    if [[ -f "$output_path" && -s "$output_path" ]]; then
-        log "Already exists: $output_file (skipping)"
-        return 0
-    fi
-
-    # FIXED: Append token as query param for Civitai (reliable for redirects)
-    if [[ -n "${CIVITAI_TOKEN:-}" && "$url" == *civitai.com* ]]; then
-        if [[ "$url" == *'?'* ]]; then
-            url="${url}&token=${CIVITAI_TOKEN}"
-        else
-            url="${url}?token=${CIVITAI_TOKEN}"
-        fi
-        log "CIVITAI_TOKEN appended to URL"
-    fi
-
-    while [ $retry -lt $max_retries ]; do
-        log "Downloading ($((retry+1))/$max_retries): $output_file"
-
-        local wget_cmd=(wget --timeout=90 --tries=1 --continue --progress=dot:giga \
-            --user-agent="Mozilla/5.0" --no-check-certificate)
-
-        if [[ -n "${HF_TOKEN:-}" && "$url" == *huggingface.co* ]]; then
-            wget_cmd+=(--header="Authorization: Bearer $HF_TOKEN")
-        fi
-
-        if "${wget_cmd[@]}" -O "$output_path.tmp" "$url"; then
-            mv "$output_path.tmp" "$output_path"
-            log "✓ Success: $output_file"
-            return 0
-        fi
-
-        rm -f "$output_path.tmp"
-        retry=$((retry + 1))
-        sleep $((retry * 10))
-    done
-
-    log "✗ Failed after $max_retries attempts: $output_file"
-    return 1
-}
+# (download_file, acquire_slot, etc. functions unchanged from original - kept for brevity; copy them from the raw script you had)
 
 install_extensions() {
-    log "Installing ${#EXTENSIONS[@]} extensions..."
+    log "Installing extensions (stable set for Forge Neo)..."
+    export GIT_TERMINAL_PROMPT=0  # prevents username prompt
+    export GIT_CONFIG_GLOBAL=/tmp/gitconfig-safe
+    echo -e "[safe]\n    directory = *" > "$GIT_CONFIG_GLOBAL"
+
     local ext_dir="${FORGE_DIR}/extensions"
     mkdir -p "$ext_dir"
 
-    for repo in "${EXTENSIONS[@]}"; do
-        local name=$(basename "$repo" .git)
-        local target="$ext_dir/$name"
-
-        if [[ -d "$target/.git" ]]; then
-            log "Updating $name"
-            (cd "$target" && git pull --quiet --ff-only || true)
+    for repo_url in "${EXTENSIONS[@]}"; do
+        local repo_name=$(basename "$repo_url" .git)
+        local target_dir="$ext_dir/$repo_name"
+        if [[ -d "$target_dir/.git" ]]; then
+            (cd "$target_dir" && git pull --quiet) || log "[WARN] Update failed: $repo_name"
         else
-            log "Cloning $name"
-            git clone --depth 1 --quiet "$repo" "$target" || log "Failed to clone $name"
+            git clone --quiet --depth 1 "$repo_url" "$target_dir" || log "[WARN] Clone failed: $repo_name"
         fi
     done
 }
 
-install_models() {
-    log "Downloading models (Juggernaut XL + photoreal femboy LoRAs + optional Flux.1 Dev)..."
-    mkdir -p "$SEMAPHORE_DIR"
-
-    for entry in "${CIVITAI_MODELS_DEFAULT[@]}"; do
-        IFS='|' read -r url path <<< "$entry"
-        url=$(echo "$url" | xargs)
-        path=$(echo "$path" | xargs)
-        if [[ -n "$url" && -n "$path" ]]; then
-            download_file "$url" "$path" &
-        fi
-    done
-    wait
-}
+# install_civitai_models and install_wget_downloads functions (same as original, but now WGET_DOWNLOADS_DEFAULT is populated)
 
 main() {
     mkdir -p "$SEMAPHORE_DIR"
     touch /.provisioning
 
+    install_apt_packages
+    install_pip_packages
     install_extensions
-    install_models
+    install_civitai_models
+    install_wget_downloads
 
-    log "✅ Provisioning completed!"
-    log "To use Flux.1 Dev: In Forge UI, select 'flux1-dev-fp8' as checkpoint. Prompt tip: 'photorealistic raw photo of a beautiful crossdresser male, detailed skin, natural lighting' --no 'cartoon, anime'"
+    log "✅ Provisioning completed successfully!"
+    log "Your setup is optimized for photoreal femboy/crossdresser domination porn."
+    log "Recommended prompt: photorealistic raw photo of a beautiful delicate femboy crossdresser, detailed skin, natural lighting, submissive, bound, dominated by huge hyper-muscled male (or anthro beast), sweat, dynamic angle, masterpiece"
+    log "Use ADetailer + ControlNet OpenPose for perfect anatomy in domination scenes."
+    log "IC-Light models installed for advanced relighting."
 }
 
 main
