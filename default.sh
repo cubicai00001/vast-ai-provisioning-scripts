@@ -1,36 +1,53 @@
 #!/bin/bash
 set -euo pipefail
 
-### Configuration - Flux Optimized (Photorealistic NSFW Focus + Fallbacks) ###
+### Configuration - Flux Optimized (Photorealistic NSFW Focus + Fallbacks + Fixes) ###
 WORKSPACE_DIR="${WORKSPACE:-/workspace}"
 FORGE_DIR="${WORKSPACE_DIR}/stable-diffusion-webui-forge"
 MODELS_DIR="${FORGE_DIR}/models"
 SEMAPHORE_DIR="${WORKSPACE_DIR}/download_sem_$$"
 MAX_PARALLEL="${MAX_PARALLEL:-3}"
 
-APT_PACKAGES=()
-PIP_PACKAGES=()
+APT_PACKAGES=(
+    # Add any needed APT packages here if required
+)
+
+PIP_PACKAGES=(
+    # Fix for mmcv installation (specific to CUDA 12.x and torch 2.4+)
+    "mmcv==2.2.0 -f https://download.openmmlab.com/mmcv/dist/cu128/torch2.4/index.html"
+)
 
 EXTENSIONS=(
     "https://github.com/wkpark/uddetailer"
     "https://github.com/Coyote-A/ultimate-upscale-for-automatic1111"
     "https://github.com/Mikubill/sd-webui-controlnet"
-    "https://github.com/Ethereum-John/sd-webui-forge-faceswaplab"
+    "https://github.com/Ethereum-John/sd-webui-forge-faceswaplab"  # Note: May have compatibility issues; disable if errors persist
     "https://github.com/Haoming02/sd-forge-ic-light"
     "https://github.com/zeittresor/sd-forge-fum"
-    "https://github.com/jessearodriguez/sd-forge-regional-prompter"
+    # Removed sd-forge-regional-prompter due to import errors (sd_hijack deprecated)
     "https://github.com/Bing-su/adetailer"
 )
 
-# Flux models and compatible LoRAs (with fallbacks for base)
+# Flux models, text encoders, LoRAs, and IC-Light models (with fallbacks where applicable)
 CIVITAI_MODELS_DEFAULT=(
-    # Primary: Flux.1 Dev NF4 quantized (12 GB) + Fallback: Flux.1 Schnell (23.8 GB)
+    # Primary: Flux.1 Dev NF4 quantized (~12 GB) + Fallback: Flux.1 Schnell (~23.8 GB)
     "https://huggingface.co/lllyasviel/flux1-dev-bnb-nf4/resolve/main/flux1-dev-bnb-nf4-v2.safetensors https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors | $MODELS_DIR/Stable-diffusion/flux1-dev-bnb-nf4-v2.safetensors"
 
-    # Flux-compatible LoRAs (realism booster + femboy + shemale)
+    # Text Encoders (required for Flux)
+    "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors | $MODELS_DIR/text_encoder/clip_l.safetensors"
+    "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors | $MODELS_DIR/text_encoder/t5xxl_fp16.safetensors"
+
+    # VAE for Flux
+    "https://huggingface.co/black-forest-labs/FLUX.1-dev/resolve/main/ae.safetensors | $MODELS_DIR/VAE/ae.safetensors"
+
+    # Flux-compatible LoRAs (realism booster + femboy + shemale - updated valid IDs/URLs)
     "https://huggingface.co/XLabs-AI/flux-RealismLora/resolve/main/lora.safetensors | $MODELS_DIR/Lora/realism_lora.safetensors"
     "https://civitai.com/api/download/models/696714 | $MODELS_DIR/Lora/femboy_flux.safetensors"
-    "https://civitai.com/api/download/models/151669 | $MODELS_DIR/Lora/shemale_flux.safetensors"
+    "https://civitai.com/api/download/models/1622153?type=Model&format=SafeTensor | $MODELS_DIR/Lora/shemale_flux.safetensors"
+
+    # IC-Light models (from extension releases - add to Unet or appropriate folder)
+    "https://github.com/Haoming02/sd-forge-ic-light/releases/download/Models/iclight_sd15_fc.safetensors | $MODELS_DIR/Unet/iclight_sd15_fc.safetensors"
+    "https://github.com/Haoming02/sd-forge-ic-light/releases/download/Models/iclight_sd15_fbc.safetensors | $MODELS_DIR/Unet/iclight_sd15_fbc.safetensors"
 )
 
 WGET_DOWNLOADS_DEFAULT=()
@@ -109,7 +126,7 @@ release_slot() { rm -f "$1"; }
 download_file() {
     local raw_urls="$1"
     local output_path="$2"
-    local min_size="${3:-10000000}"   # Default 10 MB - safe for LoRAs; override for base models
+    local min_size="${3:-10000000}"   # Default 10 MB - safe for LoRAs/text encoders; override for base models
 
     local slot
     slot=$(acquire_slot "$SEMAPHORE_DIR/dl" "$MAX_PARALLEL")
@@ -159,8 +176,20 @@ download_file() {
     return 1
 }
 
-install_apt_packages() { :; }
-install_pip_packages() { :; }
+install_apt_packages() {
+    if [[ ${#APT_PACKAGES[@]} -gt 0 ]]; then
+        log "Installing APT packages..."
+        apt-get update -qq
+        apt-get install -y --no-install-recommends "${APT_PACKAGES[@]}"
+    fi
+}
+
+install_pip_packages() {
+    if [[ ${#PIP_PACKAGES[@]} -gt 0 ]]; then
+        log "Installing PIP packages..."
+        pip install --no-cache-dir "${PIP_PACKAGES[@]}"
+    fi
+}
 
 install_extensions() {
     local -a exts=()
@@ -189,7 +218,7 @@ install_civitai_models() {
     while IFS= read -r -d '' m; do [[ -n "$m" ]] && models+=("$m"); done < <(merge_with_env "CIVITAI_MODELS" "${CIVITAI_MODELS_DEFAULT[@]}")
     [[ ${#models[@]} -eq 0 ]] && { log "No models configured"; return 0; }
 
-    log "Downloading ${#models[@]} Flux model(s)/LoRA(s)..."
+    log "Downloading ${#models[@]} Flux model(s)/LoRA(s)/encoders..."
     for entry in "${models[@]}"; do
         (
             IFS='|' read -r urls path <<< "$entry"
@@ -197,13 +226,15 @@ install_civitai_models() {
             path=$(normalize_entry "$path")
             [[ -z "$urls" || -z "$path" ]] && return
 
-            local min_size=10000000  # default for LoRAs (~10 MB min)
+            local min_size=10000000  # default for LoRAs/text encoders (~10 MB min)
 
-            # Special cases for base models (large sizes)
+            # Special cases for large files
             if [[ "$path" == *flux1-dev-bnb-nf4-v2.safetensors ]]; then
                 min_size=11000000000  # ~11 GB min for NF4 (actual ~12 GB)
             elif [[ "$path" == *flux1-schnell.safetensors ]]; then
                 min_size=20000000000  # ~20 GB min for Schnell (actual ~23.8 GB)
+            elif [[ "$path" == *t5xxl_fp16.safetensors ]]; then
+                min_size=4000000000   # ~4 GB for T5 fp16
             fi
 
             download_file "$urls" "$path" "$min_size"
@@ -224,7 +255,7 @@ main() {
     install_civitai_models
     install_wget_downloads
 
-    log "✅ Provisioning finished successfully! (All models are valid Flux files with fallbacks)"
+    log "✅ Provisioning finished successfully! (Flux setup with required encoders and fixes)"
 }
 
 main
